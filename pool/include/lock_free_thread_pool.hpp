@@ -78,11 +78,10 @@ namespace thread_pool
         {
             using ReturnType = typename std::invoke_result<Func, Args...>::type;
             using PackagedTask = std::packaged_task<ReturnType()>;
-            using PackagedTaskAllocator = typename TaskAllocTraits::template rebind_alloc<std::_Associated_state<ReturnType>>;
 
             // 创建任务包装器
-            auto task = 
-                std::allocate_shared<PackagedTask>(PackagedTaskAllocator(taskAllocator_), std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+            auto task =
+                std::make_shared<PackagedTask>(std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
 
             // 获取future
             std::future<ReturnType> result = task->get_future();
