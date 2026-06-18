@@ -13,18 +13,44 @@
 
 namespace thread_pool
 {
+    template<typename Derived, typename FuncType>
+    class ThreadPoolDispatcher
+    {
+    public:
+        using function_type = FuncType;
+
+        template<typename Func, typename... Args>
+        auto submit(Func&& func, Args&&... args) -> std::future<typename std::invoke_result<Func, Args...>::type>
+        {
+            return static_cast<Derived&>(*this).submit_impl(
+                std::forward<Func>(func),
+                std::forward<Args>(args)...);
+        }
+
+    protected:
+        ThreadPoolDispatcher() = default;
+        ~ThreadPoolDispatcher() = default;
+    };
+
     /// @brief 无锁线程池
     /// @tparam TaskAllocator 任务分配器
-    template<typename TaskAllocator = std::allocator<std::function<void()>>>
+    /// @tparam FuncType 任务函数类型
+    template<
+        typename TaskAllocator = std::allocator<std::function<void()>>,
+        typename FuncType = typename std::allocator_traits<TaskAllocator>::value_type>
     class LockFreeThreadPool
+        : public ThreadPoolDispatcher<LockFreeThreadPool<TaskAllocator, FuncType>, FuncType>
     {
     private:
-        using Task = std::function<void()>;
+        using Dispatcher = ThreadPoolDispatcher<LockFreeThreadPool<TaskAllocator, FuncType>, FuncType>;
+        friend Dispatcher;
+
+        using Task = FuncType;
         using TaskAllocTraits = std::allocator_traits<TaskAllocator>;
         using NodeType = lock_free_container::inner_queue::LockFreeNode<Task>;
         using NodeAllocator = typename TaskAllocTraits::template rebind_alloc<NodeType>;
         using NodeAllocTraits = std::allocator_traits<NodeAllocator>;
-        using TaskQueue = lock_free_container::LockFreeQueue<std::function<void()>, NodeAllocator>;
+        using TaskQueue = lock_free_container::LockFreeQueue<Task, NodeAllocator>;
 
         TaskQueue taskQueue_; // 无锁任务队列
         std::vector<std::thread> workers_; // 工作线程
@@ -67,14 +93,15 @@ namespace thread_pool
             shutdown();
         }
 
-        // 提交任务
+    private:
+        // 提交任务的当前实现，由 ThreadPoolDispatcher 通过 CRTP 分发
         /// @tparam Func 可调用对象类型
         /// @tparam Args 参数类型包
         /// @param func 可调用对象
         /// @param args 参数包
         /// @return std::future<typename std::invoke_result<Func, Args...>::type>
         template<typename Func, typename... Args>
-        auto submit(Func&& func, Args&&... args) -> std::future<typename std::invoke_result<Func, Args...>::type>
+        auto submit_impl(Func&& func, Args&&... args) -> std::future<typename std::invoke_result<Func, Args...>::type>
         {
             using ReturnType = typename std::invoke_result<Func, Args...>::type;
             using PackagedTask = std::packaged_task<ReturnType()>;
@@ -102,6 +129,7 @@ namespace thread_pool
             return result;
         }
 
+    public:
         // 等待所有任务完成
         void wait_all()
         {

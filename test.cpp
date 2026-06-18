@@ -13,6 +13,26 @@
 using lock_free_container::LockFreeQueue;
 using thread_pool::LockFreeThreadPool;
 
+class CustomTask
+{
+public:
+    CustomTask() = default;
+
+    template<typename Func>
+    CustomTask(Func&& func)
+        : func_(std::forward<Func>(func))
+    {
+    }
+
+    void operator()()
+    {
+        func_();
+    }
+
+private:
+    std::function<void()> func_;
+};
+
 void test_queue_fifo()
 {
     LockFreeQueue<int> queue;
@@ -95,7 +115,8 @@ void test_queue_concurrent()
 
 void test_thread_pool_return_values()
 {
-    LockFreeThreadPool<> pool(4);
+    using DefaultTaskAllocator = std::allocator<std::function<void()>>;
+    LockFreeThreadPool<DefaultTaskAllocator> pool(4);
 
     auto sum = pool.submit([](int a, int b) {
         return a + b;
@@ -113,6 +134,21 @@ void test_thread_pool_return_values()
     assert(pool.total_count() == 2);
     assert(pool.completed_count() == 2);
     assert(pool.active_count() == 0);
+    pool.shutdown();
+}
+
+void test_thread_pool_custom_func_type()
+{
+    using CustomTaskAllocator = std::allocator<CustomTask>;
+    LockFreeThreadPool<CustomTaskAllocator, CustomTask> pool(2);
+
+    auto result = pool.submit([](int value) {
+        return value * 2;
+    }, 21);
+
+    assert(result.get() == 42);
+    pool.wait_all();
+    assert(pool.completed_count() == 1);
     pool.shutdown();
 }
 
@@ -184,6 +220,7 @@ int main()
     test_queue_fifo();
     test_queue_concurrent();
     test_thread_pool_return_values();
+    test_thread_pool_custom_func_type();
     test_thread_pool_batch_tasks();
     test_thread_pool_exception_task();
 
