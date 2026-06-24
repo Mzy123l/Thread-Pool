@@ -2,7 +2,7 @@
 
 # Thread-Pool
 
-基于 C++20 实现的无锁队列和线程池示例项目,项目核心代码位于 `pool/include`.
+基于 C++20 实现的无锁队列和线程池示例项目，项目核心代码位于 `pool/include`。
 
 ## 目录结构
 
@@ -17,7 +17,7 @@ Thread-Pool/
     │   └── lock_free_move_only_thread_pool.hpp
     └── test/
         ├── pool.cpp
-        ├── test_move_only.cpp
+        └── test_move_only.cpp
 ```
 
 ## 功能说明
@@ -65,13 +65,14 @@ queue.clear();
 #include "pool/include/lock_free_thread_pool.hpp"
 #include <iostream>
 
-int main() {
+int main() 
+{
     thread_pool::LockFreeThreadPool<> pool(4);
 
     auto result = pool.submit(int a, int b 
-        {
-          return a + b;
-      }, 10, 20);
+	{
+       		return a + b;
+  	}, 10, 20);
 
     std::cout << result.get() << '\n';
     pool.wait_all();
@@ -87,7 +88,7 @@ int main() {
 - 所有接口（`submit`、`wait_all`、`shutdown` 等）与 `LockFreeThreadPool` 一致。
 - 任务类型可以是只移动的（如 `std::unique_ptr` 的捕获）。
 - 同样支持自定义分配器。
-- 需要C++23支持
+- 需要 C++23 支持。
 
 使用示例：
 
@@ -101,9 +102,9 @@ int main()
     thread_pool::LockFreeMoveOnlyThreadPool<> pool(4);
 
     auto result = pool.submit(std::unique_ptr<int> p 
-    {
-        return *p + 10;
-    }, std::make_unique<int>(32));
+	{
+       		return *p + 10;
+   	}, std::make_unique<int>(32));
 
     std::cout << result.get() << '\n'; // 输出 42
     pool.wait_all();
@@ -126,11 +127,11 @@ g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only
 ```
 
 
+
 ```bash
 g++ -std=c++20 -O2 -pthread test.cpp -o test -latomic
 g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only -latomic
 ```
-
 
 ## 测试内容
 
@@ -153,4 +154,5 @@ g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only -latomic
 - 线程池析构时会调用 `shutdown`，也可以手动调用 `shutdown` 提前关闭。
 - `LockFreeMoveOnlyThreadPool` 要求编译器支持 `<move_only_function>`（C++23 特性，部分 C++20 库也已提供），请确保编译环境符合要求。
 
---- 
+---
+
