@@ -35,12 +35,11 @@ namespace lock_free_container
         template<typename T>
         struct LockFreeNode
         {
-            T data;
+            T* data;
             std::atomic<LockFreeNode<T>*> next;
 
-            template<typename... Args>
-            explicit LockFreeNode(Args&&... args)
-                : data(std::forward<Args>(args)...), next(nullptr)
+            explicit LockFreeNode(T* d)
+                : data(d), next(nullptr)
             {}
 
             LockFreeNode(const LockFreeNode&) = delete;
@@ -82,106 +81,119 @@ namespace lock_free_container
     class LockFreeQueue
     {
     private:
-        // 分配器相关类型
         using Node = inner_queue::LockFreeNode<T>;
         using NodeAllocator = typename std::allocator_traits<Allocator>::template rebind_alloc<Node>;
         using AllocTraits = std::allocator_traits<NodeAllocator>;
 
-        // 头指针（带标记）
+        // 针对数据值 T 的分配器
+        using ValueAllocator = typename std::allocator_traits<Allocator>::template rebind_alloc<T>;
+        using ValueAllocTraits = std::allocator_traits<ValueAllocator>;
+
         alignas(16) std::atomic<inner_queue::DoubleWord> head_;
-
-        // 尾指针（带标记）
         alignas(16) std::atomic<inner_queue::DoubleWord> tail_;
-
-        // 分配器
         NodeAllocator allocator_;
-    public:
-        // 构造函数
-        LockFreeQueue(const Allocator& alloc = Allocator()) :allocator_(alloc)
-        {
-            // 创建哨兵节点
-            Node* dummy = allocateNode(T());
+        ValueAllocator valueAllocator_;
 
-            // 初始化头尾指针指向哨兵节点
+        static thread_local Node* toDeallocate_;
+
+    public:
+        LockFreeQueue(const Allocator& alloc = Allocator())
+            : allocator_(alloc), valueAllocator_(alloc)
+        {
+            Node* dummy = allocateNode(nullptr); // 初始化使用空指针
             inner_queue::DoubleWord init(dummy, 0);
             head_.store(init, std::memory_order_relaxed);
             tail_.store(init, std::memory_order_relaxed);
         }
 
-        // 拷贝构造函数
         LockFreeQueue(const LockFreeQueue&) = delete;
-
-        // 移动构造函数
         LockFreeQueue(LockFreeQueue&& other) noexcept
             : head_(other.head_.load(std::memory_order_relaxed)),
             tail_(other.tail_.load(std::memory_order_relaxed)),
-            allocator_(std::move(other.allocator_))
+            allocator_(std::move(other.allocator_)),
+            valueAllocator_(std::move(other.valueAllocator_))
         {
-
-            // 重置原队列
-            Node* dummy = allocateNode(T());
+            Node* dummy = allocateNode(nullptr);
             inner_queue::DoubleWord init(dummy, 0);
             other.head_.store(init, std::memory_order_relaxed);
             other.tail_.store(init, std::memory_order_relaxed);
         }
-        // 赋值运算符
+
         LockFreeQueue& operator=(const LockFreeQueue&) = delete;
         LockFreeQueue& operator=(LockFreeQueue&&) = delete;
 
         ~LockFreeQueue()
         {
             clear();
-
-            // 删除哨兵节点
             Node* dummy = static_cast<Node*>(head_.load(std::memory_order_relaxed).ptr);
             deallocateNode(dummy);
+
+            if (toDeallocate_)
+            {
+                deallocateNode(toDeallocate_);
+                toDeallocate_ = nullptr;
+            }
         }
+
         // 入队
         template <typename... Args>
             requires std::constructible_from<T, Args...>
         bool enqueue(Args&&... args)
         {
-            // 创建新节点
-            Node* newNode = allocateNode(std::forward<Args>(args)...);
+            // 1. 先用 Allocator 独立构造出数据 (T*)
+            T* newData = ValueAllocTraits::allocate(valueAllocator_, 1);
+            try
+            {
+                ValueAllocTraits::construct(valueAllocator_, newData, std::forward<Args>(args)...);
+            }
+            catch (...)
+            {
+                ValueAllocTraits::deallocate(valueAllocator_, newData, 1);
+                throw;
+            }
+
+            // 2. 把指针装载到 Node 中
+            Node* newNode;
+            try
+            {
+                newNode = allocateNode(newData);
+            }
+            catch (...)
+            {
+                ValueAllocTraits::destroy(valueAllocator_, newData);
+                ValueAllocTraits::deallocate(valueAllocator_, newData, 1);
+                throw;
+            }
 
             while (true)
             {
-                // 获取当前尾指针
                 inner_queue::DoubleWord tail = tail_.load(std::memory_order_acquire);
                 Node* tailPtr = static_cast<Node*>(tail.ptr);
 
-                // 获取尾节点的next指针
                 Node* next = tailPtr->next.load(std::memory_order_acquire);
 
-                // 验证tail是否仍然有效
-                inner_queue::DoubleWord currentTail = tail_.load(std::memory_order_acquire);
-                if (tail != currentTail)
+                if (tail != tail_.load(std::memory_order_acquire))
                 {
-                    continue; // 已被其他线程修改，重试
+                    continue;
                 }
 
                 if (next == nullptr)
                 {
-                    // 尝试将新节点链接到尾部
                     if (tailPtr->next.compare_exchange_weak(
                         next, newNode,
                         std::memory_order_release,
                         std::memory_order_relaxed))
                     {
-
-                        // 尝试更新尾指针
                         inner_queue::DoubleWord newTail(newNode, tail.tag + 1);
                         tail_.compare_exchange_strong(
                             tail, newTail,
                             std::memory_order_release,
                             std::memory_order_relaxed);
-
                         return true;
                     }
                 }
                 else
                 {
-                    // 帮助其他线程完成尾指针更新
                     inner_queue::DoubleWord newTail(next, tail.tag + 1);
                     tail_.compare_exchange_strong(
                         tail, newTail,
@@ -190,39 +202,34 @@ namespace lock_free_container
                 }
             }
         }
-
 
         // 出队
         bool dequeue(T& data)
         {
             while (true)
             {
-                // 获取头指和尾指针
-                inner_queue::DoubleWord head = head_.load(std::memory_order_acquire);
                 inner_queue::DoubleWord tail = tail_.load(std::memory_order_acquire);
-
+                inner_queue::DoubleWord head = head_.load(std::memory_order_acquire);
                 Node* headPtr = static_cast<Node*>(head.ptr);
                 Node* tailPtr = static_cast<Node*>(tail.ptr);
-                 
-                // 获取头节点的下一个节点
+
                 Node* next = headPtr->next.load(std::memory_order_acquire);
 
-                // 验证head是否仍然有效
-                inner_queue::DoubleWord currentHead = head_.load(std::memory_order_acquire);
-                if (head != currentHead)
+                if (head != head_.load(std::memory_order_acquire))
                 {
-                    continue; // 已被其他线程修改，重试
+                    continue;
                 }
 
-                // 检查队列是否为空
                 if (headPtr == tailPtr)
                 {
                     if (next == nullptr)
                     {
-                        return false; // 队列为空
+                        if (tail != tail_.load(std::memory_order_acquire))
+                        {
+                            continue;
+                        }
+                        return false;
                     }
-
-                    // 队列非空，但尾指针落后，帮助更新
                     inner_queue::DoubleWord newTail(next, tail.tag + 1);
                     tail_.compare_exchange_strong(
                         tail, newTail,
@@ -233,65 +240,68 @@ namespace lock_free_container
                 {
                     if (next == nullptr)
                     {
-                        continue; // 下一个节点为空，重试
+                        continue;
                     }
 
-                    // 读取数据
-                    data = std::move(next->data);
+                    // 在 CAS 之前，仅仅将指针读取出来。
+                    // 若线程此时被挂起，即使 next 被回收重用，ptr 悬垂指针也会因为后续 CAS 失败被丢弃，不会造成解引用
+                    T* ptr = next->data;
 
-                    // 尝试更新头指针
                     inner_queue::DoubleWord newHead(next, head.tag + 1);
                     if (head_.compare_exchange_weak(
                         head, newHead,
                         std::memory_order_release,
                         std::memory_order_relaxed))
                     {
+                        // CAS 成功，当前线程绝对占有了 ptr 数据，安全解引用
+                        if (ptr)
+                        {
+                            data = std::move(*ptr);
+                            ValueAllocTraits::destroy(valueAllocator_, ptr);
+                            ValueAllocTraits::deallocate(valueAllocator_, ptr, 1);
+                        }
 
-                        // 释放旧头节点
-                        deallocateNode(headPtr);
+                        // 延迟释放旧头节点
+                        if (toDeallocate_)
+                        {
+                            deallocateNode(toDeallocate_);
+                        }
+                        toDeallocate_ = headPtr;
+
                         return true;
                     }
                 }
             }
         }
-        // 清空队列
+
         void clear()
         {
             T dummy;
-            while (dequeue(dummy))
-            {
-                // 不断出队直到队列为空
-            }
+            while (dequeue(dummy)) {}
         }
 
-        // 检查队列是否为空
         bool empty() const
         {
             inner_queue::DoubleWord head = head_.load(std::memory_order_acquire);
             inner_queue::DoubleWord tail = tail_.load(std::memory_order_acquire);
-
             Node* headPtr = static_cast<Node*>(head.ptr);
             Node* tailPtr = static_cast<Node*>(tail.ptr);
-
             return headPtr == tailPtr &&
                 headPtr->next.load(std::memory_order_acquire) == nullptr;
         }
 
-        // 获取分配器
         NodeAllocator getAllocator() const noexcept
         {
             return allocator_;
         }
 
     private:
-        // 分配节点
-        template<typename... Args>
-        Node* allocateNode(Args&&... args)
+        Node* allocateNode(T* d)
         {
             Node* node = AllocTraits::allocate(allocator_, 1);
             try
             {
-                AllocTraits::construct(allocator_, node, std::forward<Args>(args)...);
+                AllocTraits::construct(allocator_, node, d);
             }
             catch (...)
             {
@@ -300,8 +310,7 @@ namespace lock_free_container
             }
             return node;
         }
-    
-        // 释放节点
+
         void deallocateNode(Node* node) noexcept
         {
             if (node)
@@ -310,13 +319,8 @@ namespace lock_free_container
                 AllocTraits::deallocate(allocator_, node, 1);
             }
         }
-    
-        static Node* getPtr(const inner_queue::DoubleWord& dw)
-        {
-            return static_cast<Node*>(dw.ptr);
-        }
-
     };
 
-    
+    template<typename T, typename Allocator>
+    thread_local typename LockFreeQueue<T, Allocator>::Node* LockFreeQueue<T, Allocator>::toDeallocate_ = nullptr;
 }

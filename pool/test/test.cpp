@@ -1,5 +1,4 @@
-#include "pool/include/lock_free_queue.hpp"
-#include "pool/include/lock_free_thread_pool.hpp"
+#include "../include/lock_free_thread_pool.hpp"
 
 #include <atomic>
 #include <cassert>

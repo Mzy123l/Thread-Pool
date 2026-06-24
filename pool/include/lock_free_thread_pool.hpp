@@ -78,7 +78,7 @@ namespace thread_pool
         {
             using ReturnType = typename std::invoke_result<Func, Args...>::type;
             using PackagedTask = std::packaged_task<ReturnType()>;
-            using PackagedTaskAllocator = typename TaskAllocTraits::template rebind_alloc<std::_Associated_state<ReturnType>>;
+            using PackagedTaskAllocator = typename TaskAllocTraits::template rebind_alloc<PackagedTask>;
 
             // 创建任务包装器
             auto task = 
@@ -204,4 +204,4 @@ namespace thread_pool
         }
 
     };
-} // namespace lock_free_thread_pool
+} 
