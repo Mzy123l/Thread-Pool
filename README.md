@@ -1,20 +1,23 @@
+---
+
 # Thread-Pool
 
-基于 C++20 实现的无锁队列和线程池示例项目。项目核心代码位于 `pool/include`，根目录的 `test.cpp` 提供了基础功能测试和使用示例。
+基于 C++20 实现的无锁队列和线程池示例项目,项目核心代码位于 `pool/include`.
 
 ## 目录结构
 
 ```text
 Thread-Pool/
 ├── README.md
-├── test.cpp
 ├── LICENSE
 └── pool/
     ├── include/
     │   ├── lock_free_queue.hpp
-    │   └── lock_free_thread_pool.hpp
+    │   ├── lock_free_thread_pool.hpp
+    │   └── lock_free_move_only_thread_pool.hpp
     └── test/
-        └── pool.cpp
+        ├── pool.cpp
+        ├── test_move_only.cpp
 ```
 
 ## 功能说明
@@ -37,7 +40,8 @@ queue.enqueue(1);
 queue.enqueue(2);
 
 int value = 0;
-if (queue.dequeue(value)) {
+if (queue.dequeue(value)) 
+{
     // value == 1
 }
 
@@ -64,11 +68,44 @@ queue.clear();
 int main() {
     thread_pool::LockFreeThreadPool<> pool(4);
 
-    auto result = pool.submit([](int a, int b) {
-        return a + b;
-    }, 10, 20);
+    auto result = pool.submit(int a, int b 
+        {
+          return a + b;
+      }, 10, 20);
 
     std::cout << result.get() << '\n';
+    pool.wait_all();
+    pool.shutdown();
+}
+```
+
+### LockFreeMoveOnlyThreadPool
+
+`thread_pool::LockFreeMoveOnlyThreadPool<>` 与 `LockFreeThreadPool` 功能相同，
+但内部使用 `std::move_only_function` 替代 `std::function`，从而支持 **move-only 任务**（例如捕获了不可复制资源的 lambda）。
+
+- 所有接口（`submit`、`wait_all`、`shutdown` 等）与 `LockFreeThreadPool` 一致。
+- 任务类型可以是只移动的（如 `std::unique_ptr` 的捕获）。
+- 同样支持自定义分配器。
+- 需要C++23支持
+
+使用示例：
+
+```cpp
+#include "pool/include/lock_free_move_only_thread_pool.hpp"
+#include <iostream>
+#include <memory>
+
+int main() 
+{
+    thread_pool::LockFreeMoveOnlyThreadPool<> pool(4);
+
+    auto result = pool.submit(std::unique_ptr<int> p 
+    {
+        return *p + 10;
+    }, std::make_unique<int>(32));
+
+    std::cout << result.get() << '\n'; // 输出 42
     pool.wait_all();
     pool.shutdown();
 }
@@ -79,28 +116,26 @@ int main() {
 项目使用 C++20 标准。可以在仓库根目录执行：
 
 ```bash
+# 测试 LockFreeThreadPool（test.cpp）
 g++ -std=c++20 -O2 -pthread test.cpp -o test
 ./test
+
+# 测试 LockFreeMoveOnlyThreadPool（test_move_only.cpp）
+g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only
+./test_move_only
 ```
 
-如果使用 MinGW 且链接 128 位原子操作时报错，可以追加 `-latomic`：
 
 ```bash
 g++ -std=c++20 -O2 -pthread test.cpp -o test -latomic
-./test
+g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only -latomic
 ```
 
-Windows PowerShell 下运行：
-
-```powershell
-g++ -std=c++20 -O2 -pthread test.cpp -o test.exe -latomic
-.\test.exe
-```
 
 ## 测试内容
 
-`test.cpp` 覆盖以下内容：
-
+### `test.cpp`
+覆盖以下内容：
 - 单线程队列 FIFO 顺序。
 - 空队列出队行为。
 - 多生产者、多消费者并发入队出队。
@@ -109,8 +144,13 @@ g++ -std=c++20 -O2 -pthread test.cpp -o test.exe -latomic
 - 线程池异常任务不会导致工作线程退出。
 - 线程池任务统计计数。
 
+### `test_move_only.cpp`
+与 `test.cpp` 的测试用例完全一致，但使用的是 `LockFreeMoveOnlyThreadPool`，验证 move-only 任务的支持情况。
+
 ## 注意事项
 
 - `LockFreeQueue<T>` 当前实现会创建一个哨兵节点，因此 `T` 需要支持默认构造。
 - 线程池析构时会调用 `shutdown`，也可以手动调用 `shutdown` 提前关闭。
-- 该项目主要用于学习无锁队列和线程池的基本实现思路，实际生产环境还需要更完整的压力测试和平台兼容性验证。
+- `LockFreeMoveOnlyThreadPool` 要求编译器支持 `<move_only_function>`（C++23 特性，部分 C++20 库也已提供），请确保编译环境符合要求。
+
+--- 
