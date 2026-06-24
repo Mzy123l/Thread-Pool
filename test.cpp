@@ -11,7 +11,9 @@
 #include <vector>
 
 using lock_free_container::LockFreeQueue;
-using thread_pool::LockFreeThreadPool;
+using lock_free::DynamicMoveOnlyPool;
+using lock_free::DynamicPool;
+using lock_free::StaticPool;
 
 class CustomTask
 {
@@ -116,7 +118,7 @@ void test_queue_concurrent()
 void test_thread_pool_return_values()
 {
     using DefaultTaskAllocator = std::allocator<std::function<void()>>;
-    LockFreeThreadPool<DefaultTaskAllocator> pool(4);
+    DynamicPool<DefaultTaskAllocator> pool(4);
 
     auto sum = pool.submit([](int a, int b) {
         return a + b;
@@ -139,22 +141,21 @@ void test_thread_pool_return_values()
 
 void test_thread_pool_custom_func_type()
 {
-    using CustomTaskAllocator = std::allocator<CustomTask>;
-    LockFreeThreadPool<CustomTaskAllocator, CustomTask> pool(2);
+    StaticPool<CustomTask> pool(2);
 
-    auto result = pool.submit([](int value) {
-        return value * 2;
-    }, 21);
-
-    assert(result.get() == 42);
+    std::atomic<int> value{0};
+    pool.submit(CustomTask([&value] {
+        value.store(42, std::memory_order_release);
+    }));
     pool.wait_all();
     assert(pool.completed_count() == 1);
+    assert(value.load(std::memory_order_acquire) == 42);
     pool.shutdown();
 }
 
 void test_thread_pool_batch_tasks()
 {
-    LockFreeThreadPool<> pool(4);
+    DynamicPool<> pool(4);
     std::atomic<int> counter{0};
     std::vector<std::future<int>> futures;
 
@@ -185,7 +186,7 @@ void test_thread_pool_batch_tasks()
 
 void test_thread_pool_exception_task()
 {
-    LockFreeThreadPool<> pool(2);
+    DynamicPool<> pool(2);
 
     auto failed = pool.submit([]() -> int {
         throw std::runtime_error("expected test exception");
@@ -215,14 +216,57 @@ void test_thread_pool_exception_task()
     pool.shutdown();
 }
 
+std::atomic<int>* staticCounter = nullptr;
+
+void increment_static_counter()
+{
+    staticCounter->fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_thread_pool_static_function_pointer()
+{
+    StaticPool<void(*)()> pool(2);
+    std::atomic<int> counter{0};
+    staticCounter = &counter;
+
+    pool.submit_static(&increment_static_counter);
+    pool.submit(&increment_static_counter);
+    pool.wait_all();
+
+    assert(counter.load(std::memory_order_relaxed) == 2);
+    assert(pool.completed_count() == 2);
+    pool.shutdown();
+    staticCounter = nullptr;
+}
+
+#if defined(__cpp_lib_move_only_function) && __cpp_lib_move_only_function >= 202110L
+void test_thread_pool_move_only_return_values()
+{
+    DynamicMoveOnlyPool<> pool(2);
+
+    auto value = pool.submit([] {
+        return 123;
+    });
+
+    assert(value.get() == 123);
+    pool.wait_all();
+    assert(pool.completed_count() == 1);
+    pool.shutdown();
+}
+#endif
+
 int main()
 {
     test_queue_fifo();
     test_queue_concurrent();
     test_thread_pool_return_values();
     test_thread_pool_custom_func_type();
+    test_thread_pool_static_function_pointer();
     test_thread_pool_batch_tasks();
     test_thread_pool_exception_task();
+#if defined(__cpp_lib_move_only_function) && __cpp_lib_move_only_function >= 202110L
+    test_thread_pool_move_only_return_values();
+#endif
 
     std::cout << "All tests passed.\n";
     return 0;

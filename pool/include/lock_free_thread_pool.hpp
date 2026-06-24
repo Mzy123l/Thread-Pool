@@ -1,151 +1,116 @@
-﻿#pragma once
+#pragma once
+
 #include "lock_free_queue.hpp"
+
+#include <algorithm>
 #include <atomic>
-#include <thread>
+#include <concepts>
+#include <cstddef>
 #include <functional>
+#include <future>
+#include <memory>
+#include <stdexcept>
+#include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
-#include <future>
-#include <type_traits>
-#include <memory>
-#include <algorithm>
-#include <stdexcept>
 
-namespace thread_pool
+namespace lock_free
 {
-    template<typename Derived, typename FuncType>
-    class ThreadPoolDispatcher
+    namespace inner_lock_free
     {
-    public:
-        using function_type = FuncType;
-
-        template<typename Func, typename... Args>
-        auto submit(Func&& func, Args&&... args) -> std::future<typename std::invoke_result<Func, Args...>::type>
+        /// @brief Common lock-free worker pool core.
+        /// @tparam FuncType Exact task representation stored in the queue.
+        /// @tparam Derived CRTP derived pool type.
+        /// @tparam TaskAllocator Allocator for FuncType nodes.
+        template<
+            typename FuncType,
+            typename Derived,
+            typename TaskAllocator = std::allocator<FuncType>>
+        class Base
         {
-            return static_cast<Derived&>(*this).submit_impl(
-                std::forward<Func>(func),
-                std::forward<Args>(args)...);
-        }
+        protected:
+            using Task = FuncType;
+            using TaskAllocTraits = std::allocator_traits<TaskAllocator>;
+            using NodeType = lock_free_container::inner_queue::LockFreeNode<Task>;
+            using NodeAllocator = typename TaskAllocTraits::template rebind_alloc<NodeType>;
+            using TaskQueue = lock_free_container::LockFreeQueue<Task, NodeAllocator>;
 
-    protected:
-        ThreadPoolDispatcher() = default;
-        ~ThreadPoolDispatcher() = default;
-    };
+            TaskQueue taskQueue_;
+            std::vector<std::thread> workers_;
+            std::atomic<bool> stop_{false};
+            std::atomic<std::size_t> activeTasks_{0};
+            std::atomic<std::size_t> totalTasks_{0};
+            std::atomic<std::size_t> completedTasks_{0};
+            TaskAllocator taskAllocator_;
 
-    /// @brief 无锁线程池
-    /// @tparam TaskAllocator 任务分配器
-    /// @tparam FuncType 任务函数类型
-    template<
-        typename TaskAllocator = std::allocator<std::function<void()>>,
-        typename FuncType = typename std::allocator_traits<TaskAllocator>::value_type>
-    class LockFreeThreadPool
-        : public ThreadPoolDispatcher<LockFreeThreadPool<TaskAllocator, FuncType>, FuncType>
-    {
-    private:
-        using Dispatcher = ThreadPoolDispatcher<LockFreeThreadPool<TaskAllocator, FuncType>, FuncType>;
-        friend Dispatcher;
-
-        using Task = FuncType;
-        using TaskAllocTraits = std::allocator_traits<TaskAllocator>;
-        using NodeType = lock_free_container::inner_queue::LockFreeNode<Task>;
-        using NodeAllocator = typename TaskAllocTraits::template rebind_alloc<NodeType>;
-        using NodeAllocTraits = std::allocator_traits<NodeAllocator>;
-        using TaskQueue = lock_free_container::LockFreeQueue<Task, NodeAllocator>;
-
-        TaskQueue taskQueue_; // 无锁任务队列
-        std::vector<std::thread> workers_; // 工作线程
-        std::atomic<bool> stop_{false};  // 停止标志
-        std::atomic<std::size_t> activeTasks_{ 0 }; // 活跃任务计数
-        std::atomic<std::size_t> totalTasks_{ 0 }; // 总任务计数
-        std::atomic<std::size_t> completedTasks_{ 0 }; // 完成任务计数
-
-        // 存储分配器实例
-        TaskAllocator taskAllocator_;
-
-    public:
-        // 构造函数
-        // 禁止隐式转换
-        // @param numThreads 线程数 默认为硬件并发线程数
-        // @param alloc为任务分配器实例
-        explicit LockFreeThreadPool(std::size_t numThreads = std::thread::hardware_concurrency(), const TaskAllocator& alloc = TaskAllocator())
-            : taskQueue_(NodeAllocator(alloc)), taskAllocator_(alloc)
-        {
-            workers_.reserve(numThreads);
-            for (size_t i = 0; i < numThreads; ++i)
+            explicit Base(
+                std::size_t numThreads = std::thread::hardware_concurrency(),
+                const TaskAllocator& alloc = TaskAllocator())
+                : taskQueue_(NodeAllocator(alloc)), taskAllocator_(alloc)
             {
-                workers_.emplace_back([this] { this->workerThread(); });
+                if (numThreads == 0)
+                {
+                    numThreads = 1;
+                }
+
+                workers_.reserve(numThreads);
+                for (std::size_t i = 0; i < numThreads; ++i)
+                {
+                    workers_.emplace_back([this] { this->workerThread(); });
+                }
             }
 
-        }
-
-        // 禁止拷贝构造 
-        LockFreeThreadPool(const LockFreeThreadPool&) = delete;
-        // 禁止拷贝赋值
-        LockFreeThreadPool& operator=(const LockFreeThreadPool&) = delete;
-        // 禁止移动构造
-        LockFreeThreadPool(LockFreeThreadPool&&) = delete;
-        // 禁止移动赋值
-        LockFreeThreadPool& operator=(LockFreeThreadPool&&) = delete;
-        
-        // 析构函数
-        ~LockFreeThreadPool()
-        {
-            shutdown();
-        }
-
-    private:
-        // 提交任务的当前实现，由 ThreadPoolDispatcher 通过 CRTP 分发
-        /// @tparam Func 可调用对象类型
-        /// @tparam Args 参数类型包
-        /// @param func 可调用对象
-        /// @param args 参数包
-        /// @return std::future<typename std::invoke_result<Func, Args...>::type>
-        template<typename Func, typename... Args>
-        auto submit_impl(Func&& func, Args&&... args) -> std::future<typename std::invoke_result<Func, Args...>::type>
-        {
-            using ReturnType = typename std::invoke_result<Func, Args...>::type;
-            using PackagedTask = std::packaged_task<ReturnType()>;
-
-            // 创建任务包装器
-            auto task =
-                std::make_shared<PackagedTask>(std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
-
-            // 获取future
-            std::future<ReturnType> result = task->get_future();
-
-            // 包装任务到void()函数
-            Task wrapper = [task]() { (*task)(); };
-            
-            // 提交任务
-            totalTasks_.fetch_add(1, std::memory_order_relaxed);
-            activeTasks_.fetch_add(1, std::memory_order_relaxed);
-
-            if (!taskQueue_.enqueue(std::move(wrapper)))
+            ~Base()
             {
-                activeTasks_.fetch_sub(1, std::memory_order_relaxed);
-                throw std::runtime_error("Failed to enqueue task");
+                shutdown();
             }
 
-            return result;
-        }
+            Base(const Base&) = delete;
+            Base& operator=(const Base&) = delete;
+            Base(Base&&) = delete;
+            Base& operator=(Base&&) = delete;
 
-    public:
-        // 等待所有任务完成
-        void wait_all()
-        {
-            while (activeTasks_.load(std::memory_order_acquire) > 0)
+            void enqueue_task(Task task)
             {
-                std::this_thread::yield();
+                totalTasks_.fetch_add(1, std::memory_order_relaxed);
+                activeTasks_.fetch_add(1, std::memory_order_relaxed);
+
+                if (!taskQueue_.enqueue(std::move(task)))
+                {
+                    activeTasks_.fetch_sub(1, std::memory_order_relaxed);
+                    throw std::runtime_error("Failed to enqueue task");
+                }
             }
-        }
 
-
-        // 优雅关闭
-        void shutdown()
-        {
-            if (!stop_.exchange(true, std::memory_order_release))
+        public:
+            void wait_all()
             {
-                // 唤醒所有等待的线程
+                while (activeTasks_.load(std::memory_order_acquire) > 0)
+                {
+                    std::this_thread::yield();
+                }
+            }
+
+            void shutdown()
+            {
+                if (!stop_.exchange(true, std::memory_order_release))
+                {
+                    for (auto& worker : workers_)
+                    {
+                        if (worker.joinable())
+                        {
+                            worker.join();
+                        }
+                    }
+                }
+            }
+
+            void shutdown_now()
+            {
+                stop_.store(true, std::memory_order_release);
+                taskQueue_.clear();
+
                 for (auto& worker : workers_)
                 {
                     if (worker.joinable())
@@ -154,81 +119,177 @@ namespace thread_pool
                     }
                 }
             }
-        }
-        // 立即关闭
-        void shutdown_now()
-        {
-            stop_.store(true, std::memory_order_release);
 
-            // 清空任务队列
-            taskQueue_.clear();
-
-            // 等待线程结束
-            for (auto& worker : workers_)
+            std::size_t active_count() const
             {
-                if (worker.joinable())
+                return activeTasks_.load(std::memory_order_relaxed);
+            }
+
+            std::size_t total_count() const
+            {
+                return totalTasks_.load(std::memory_order_relaxed);
+            }
+
+            std::size_t completed_count() const
+            {
+                return completedTasks_.load(std::memory_order_relaxed);
+            }
+
+            std::size_t thread_count() const
+            {
+                return workers_.size();
+            }
+
+            TaskAllocator get_allocator() const noexcept
+            {
+                return taskAllocator_;
+            }
+
+        private:
+            void workerThread()
+            {
+                while (!stop_.load(std::memory_order_acquire) ||
+                       activeTasks_.load(std::memory_order_acquire) > 0)
                 {
-                    worker.join();
+                    Task task{};
+                    if (taskQueue_.dequeue(task))
+                    {
+                        try
+                        {
+                            task();
+                        }
+                        catch (...)
+                        {
+                            // Exceptions are transported by packaged_task for
+                            // dynamic pools. Raw static tasks are intentionally
+                            // fire-and-forget.
+                        }
+
+                        completedTasks_.fetch_add(1, std::memory_order_relaxed);
+                        activeTasks_.fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        std::this_thread::yield();
+                    }
                 }
             }
+        };
+    } // namespace inner_lock_free
+
+    /// @brief Dynamic task pool backed by std::function<void()>.
+    /// This keeps the old fully generic submit surface, but uses type erasure.
+    template<typename TaskAllocator = std::allocator<std::function<void()>>>
+    class DynamicPool
+        : public inner_lock_free::Base<
+              std::function<void()>,
+              DynamicPool<TaskAllocator>,
+              TaskAllocator>
+    {
+        using Task = std::function<void()>;
+        using Base = inner_lock_free::Base<Task, DynamicPool<TaskAllocator>, TaskAllocator>;
+
+    public:
+        explicit DynamicPool(
+            std::size_t numThreads = std::thread::hardware_concurrency(),
+            const TaskAllocator& alloc = TaskAllocator())
+            : Base(numThreads, alloc)
+        {
         }
 
-        // 获取活跃任务数
-        std::size_t active_count() const
+        template<typename Func, typename... Args>
+        auto submit(Func&& func, Args&&... args)
+            -> std::future<std::invoke_result_t<Func, Args...>>
         {
-            return activeTasks_.load(std::memory_order_relaxed);
-        }
+            using ReturnType = std::invoke_result_t<Func, Args...>;
+            using PackagedTask = std::packaged_task<ReturnType()>;
 
-        // 获取总任务数
-        std::size_t total_count() const
-        {
-            return totalTasks_.load(std::memory_order_relaxed);
-        }
+            auto task = std::make_shared<PackagedTask>(
+                std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+            auto result = task->get_future();
 
-        // 获取完成任务数
-        std::size_t completed_count() const
-        {
-            return completedTasks_.load(std::memory_order_relaxed);
+            this->enqueue_task(Task([task] { (*task)(); }));
+            return result;
         }
-
-        // 获取线程数
-        std::size_t thread_count() const
-        {
-            return workers_.size();
-        }
-
-        // 获取分配器
-        TaskAllocator get_allocator() const noexcept
-        {
-            return taskAllocator_;
-        }
-    private:
-        // 工作线程函数
-        void workerThread()
-        {
-            while (!stop_.load(std::memory_order_acquire) || activeTasks_.load(std::memory_order_acquire) > 0)
-            {
-                Task task;
-                if (taskQueue_.dequeue(task))
-                {
-                    try
-                    {
-                        task();
-                    }
-                    catch (...)
-                    {
-                        // 处理任务执行中的异常
-                    }
-                    completedTasks_.fetch_add(1, std::memory_order_relaxed);
-                    activeTasks_.fetch_sub(1, std::memory_order_relaxed);
-                }
-                else
-                {
-                    // 没有任务，休息一下
-                    std::this_thread::yield();
-                }
-            }
-        }
-
     };
-} // namespace lock_free_thread_pool
+
+#if defined(__cpp_lib_move_only_function) && __cpp_lib_move_only_function >= 202110L
+    /// @brief Dynamic task pool backed by std::move_only_function<void()>.
+    /// Avoids the shared_ptr hop required by std::function + packaged_task.
+    template<typename TaskAllocator = std::allocator<std::move_only_function<void()>>>
+    class DynamicMoveOnlyPool
+        : public inner_lock_free::Base<
+              std::move_only_function<void()>,
+              DynamicMoveOnlyPool<TaskAllocator>,
+              TaskAllocator>
+    {
+        using Task = std::move_only_function<void()>;
+        using Base = inner_lock_free::Base<Task, DynamicMoveOnlyPool<TaskAllocator>, TaskAllocator>;
+
+    public:
+        explicit DynamicMoveOnlyPool(
+            std::size_t numThreads = std::thread::hardware_concurrency(),
+            const TaskAllocator& alloc = TaskAllocator())
+            : Base(numThreads, alloc)
+        {
+        }
+
+        template<typename Func, typename... Args>
+        auto submit(Func&& func, Args&&... args)
+            -> std::future<std::invoke_result_t<Func, Args...>>
+        {
+            using ReturnType = std::invoke_result_t<Func, Args...>;
+
+            std::packaged_task<ReturnType()> task(
+                std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+            auto result = task.get_future();
+
+            this->enqueue_task(Task([task = std::move(task)]() mutable { task(); }));
+            return result;
+        }
+    };
+#endif
+
+    /// @brief Static task pool with no type-erased task wrapper.
+    /// @tparam FuncType Exact task type, for example void(*)().
+    /// StaticPool stores FuncType directly; different callable types require
+    /// different StaticPool<FuncType> instantiations.
+    template<
+        typename FuncType,
+        typename TaskAllocator = std::allocator<FuncType>>
+    class StaticPool
+        : public inner_lock_free::Base<
+              FuncType,
+              StaticPool<FuncType, TaskAllocator>,
+              TaskAllocator>
+    {
+        using Base = inner_lock_free::Base<
+            FuncType,
+            StaticPool<FuncType, TaskAllocator>,
+            TaskAllocator>;
+
+    public:
+        explicit StaticPool(
+            std::size_t numThreads = std::thread::hardware_concurrency(),
+            const TaskAllocator& alloc = TaskAllocator())
+            : Base(numThreads, alloc)
+        {
+        }
+
+        void submit_static(FuncType task)
+        {
+            this->enqueue_task(std::move(task));
+        }
+
+        void submit(FuncType task)
+        {
+            submit_static(std::move(task));
+        }
+    };
+} // namespace lock_free
+
+namespace thread_pool
+{
+    template<typename TaskAllocator = std::allocator<std::function<void()>>>
+    using LockFreeThreadPool = lock_free::DynamicPool<TaskAllocator>;
+} // namespace thread_pool
