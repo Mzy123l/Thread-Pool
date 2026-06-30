@@ -73,6 +73,13 @@ auto f2 = pool.submit([](int x){ return x * x; }, 5);
 thread_pool::LockFreeThreadPool<> pool2(2);
 ```
 
+#### 模板参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型 |
+| `TaskAllocator` | `std::allocator<std::function<void()>>` | 任务内存分配器 |
+
 ### 2. DynamicMoveOnlyThreadPool（C++23）
 
 基于 `std::move_only_function<void()>`，支持捕获 `std::unique_ptr` 等 move-only 对象。
@@ -86,6 +93,13 @@ auto fut = pool.submit([p = std::move(ptr)] { return *p; });
 // 向后兼容别名
 thread_pool::LockFreeMoveOnlyThreadPool<> pool2(2);
 ```
+
+#### 模板参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型 |
+| `TaskAllocator` | `std::allocator<std::move_only_function<void()>>` | 任务内存分配器 |
 
 ### 3. VariantThreadPool
 
@@ -102,6 +116,14 @@ using TaskVariant = std::variant<
 thread_pool::VariantThreadPool<TaskVariant> pool(4);
 auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 ```
+
+#### 模板参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `VariantType` | （必填） | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
+| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
+| `TaskAllocator` | `std::allocator<VariantType>` | 任务内存分配器 |
 
 ## 替换队列类型
 
@@ -168,13 +190,21 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 ## 性能
 
-以下数据基于 12 核 CPU，GCC 15.2，-O2：
+以下数据基于 12 核 CPU，GCC 15.2，-O3：
 
-| 场景 | 有锁线程池 | 无锁 function | 无锁 move_only | 加速比 |
-|------|-----------|--------------|---------------|--------|
-| 轻量任务 (50000) | 493 ms | 282 ms | 229 ms | **2.15×** |
-| 重量任务 (200) | 33 ms | 14 ms | 18 ms | **2.33×** |
-| IO 混合 (2000) | 20 ms | 21 ms | 19 ms | 1.08× |
+| 场景 | 有锁线程池 | function | move_only | variant | 最佳加速比 |
+|------|-----------|----------|-----------|---------|-----------|
+| 轻量任务 (50000) | 301 ms | 316 ms | 262 ms | 221 ms | **1.36×** |
+| 重量任务 (200) | 15 ms | 4 ms | 4 ms | 3 ms | **5.17×** |
+| IO 混合 (2000) | 18 ms | 19 ms | 19 ms | 19 ms | 1.04× |
+
+> 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
+
+### 性能说明
+
+- **轻量任务**：VariantThreadPool 因编译期分发消除了 `std::function` 的类型擦除开销，性能最优；move_only 略优于 function。
+- **重量任务**：任务执行时间远大于调度开销，三种无锁变体均远超有锁线程池，VariantThreadPool 可达 **5×** 加速。
+- **IO 混合**：瓶颈在 IO 等待而非调度，各实现差异不大。
 
 ## 编译器要求
 
