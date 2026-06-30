@@ -104,7 +104,6 @@ public:
     {
         stop_.store(true, std::memory_order_release);
 
-        // 排空队列并丢弃所有待处理任务
         Task dummy{};
         while (POOL_LIKELY(task_queue_.dequeue(dummy)))
         {
@@ -112,7 +111,6 @@ public:
             total_tasks_.fetch_sub(1, std::memory_order_relaxed);
         }
 
-        // 等待正在执行的任务完成
         while (POOL_UNLIKELY(
             active_tasks_.load(std::memory_order_acquire) > 0))
         {
@@ -158,11 +156,8 @@ protected:
         total_tasks_.fetch_add(1, std::memory_order_relaxed);
         active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
-        // 尝试入队；环形队列满时返回 false，自旋重试
         while (POOL_UNLIKELY(!task_queue_.enqueue(std::move(task))))
         {
-            // task 在 enqueue 失败时未被消费：
-            // 环形队列在 CAS 成功后才构造，因此 task 仍然有效
             std::this_thread::yield();
         }
     }
@@ -196,8 +191,7 @@ private:
                 }
                 catch (...)
                 {
-                    // 任务异常已由 packaged_task::get_future()
-                    // 传播给调用方，工作线程继续运行
+                    // 异常由 packaged_task::get_future() 传播给调用方
                 }
                 completed_tasks_.fetch_add(1,
                                            std::memory_order_relaxed);
@@ -206,7 +200,6 @@ private:
             }
             else
             {
-                // 队列为空，短暂让出 CPU
                 std::this_thread::yield();
             }
         }

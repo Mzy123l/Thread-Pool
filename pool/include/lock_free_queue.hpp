@@ -1,86 +1,98 @@
 #pragma once
+// ============================================================
+// lock_free_queue.hpp — Michael-Scott 无锁队列
+// ============================================================
+// 基于链表的无锁并发队列，支持多生产者多消费者（MPMC）。
+// 使用双字 CAS（DoubleWord）防止 ABA 问题，延迟释放保证安全。
+//
+// 模板参数：
+//   T         — 元素类型（必须默认可构造）
+//   Allocator — 分配器类型
+// ============================================================
+
 #include "lock_free_utility.hpp"
 
 #include <atomic>
-#include <memory>
 #include <cstdint>
+#include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
-#include <new>
-#include <concepts>
 
 namespace lock_free_container
 {
-    namespace inner_queue
+namespace inner_queue
+{
+
+// 128 位原子结构体，用于双字 CAS（防 ABA）
+struct alignas(16) DoubleWord
+{
+    void* ptr;
+    uint64_t tag;
+
+    DoubleWord() : ptr(nullptr), tag(0) {}
+    DoubleWord(void* p, uint64_t t) : ptr(p), tag(t) {}
+
+    bool operator==(const DoubleWord& other) const
     {
-        // 定义128位原子结构体，用于双字CAS
-        struct alignas(16) DoubleWord
-        {
-            void* ptr;        // 64位指针
-            uint64_t tag;     // 64位标记（用于避免ABA问题）
-
-            DoubleWord() : ptr(nullptr), tag(0) {}
-            DoubleWord(void* p, uint64_t t) : ptr(p), tag(t) {}
-
-            bool operator==(const DoubleWord& other) const
-            {
-                return ptr == other.ptr && tag == other.tag;
-            }
-
-            bool operator!=(const DoubleWord& other) const
-            {
-                return !(*this == other);
-            }
-        };
-
-        // 无锁队列节点
-        template<typename T>
-        struct LockFreeNode
-        {
-            T* data;
-            std::atomic<LockFreeNode<T>*> next;
-
-            explicit LockFreeNode(T* d)
-                : data(d), next(nullptr)
-            {}
-
-            LockFreeNode(const LockFreeNode&) = delete;
-            LockFreeNode& operator=(const LockFreeNode&) = delete;
-        };
-
-        // 默认分配器
-        template<typename T>
-        struct DefaultAllocator
-        {
-            using value_type = T;
-            using size_type = size_t;
-            using difference_type = ptrdiff_t;
-
-            template<typename U>
-            struct rebind
-            {
-                using other = DefaultAllocator<U>;
-            };
-
-            DefaultAllocator() noexcept = default;
-            template<typename U> DefaultAllocator(const DefaultAllocator<U>&) noexcept {}
-
-            T* allocate(size_t n)
-            {
-                return static_cast<T*>(::operator new(n * sizeof(T)));
-            }
-
-            void deallocate(T* p, size_t) noexcept
-            {
-                ::operator delete(p);
-            }
-        };
+        return ptr == other.ptr && tag == other.tag;
     }
 
-    // 无锁队列
-    /// @brief 链表实现
-    template<typename T, typename Allocator = inner_queue::DefaultAllocator<T>>
-    class LockFreeQueue
+    bool operator!=(const DoubleWord& other) const
+    {
+        return !(*this == other);
+    }
+};
+
+// 链表节点
+template <typename T>
+struct LockFreeNode
+{
+    T* data;
+    std::atomic<LockFreeNode<T>*> next;
+
+    explicit LockFreeNode(T* d) : data(d), next(nullptr) {}
+
+    LockFreeNode(const LockFreeNode&) = delete;
+    LockFreeNode& operator=(const LockFreeNode&) = delete;
+};
+
+// 默认分配器（::operator new/delete）
+template <typename T>
+struct DefaultAllocator
+{
+    using value_type = T;
+    using size_type = size_t;
+    using difference_type = ptrdiff_t;
+
+    template <typename U>
+    struct rebind
+    {
+        using other = DefaultAllocator<U>;
+    };
+
+    DefaultAllocator() noexcept = default;
+    template <typename U>
+    DefaultAllocator(const DefaultAllocator<U>&) noexcept
+    {
+    }
+
+    T* allocate(size_t n)
+    {
+        return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+
+    void deallocate(T* p, size_t) noexcept
+    {
+        ::operator delete(p);
+    }
+};
+
+}  // namespace inner_queue
+
+template <typename T,
+          typename Allocator = inner_queue::DefaultAllocator<T>>
+class LockFreeQueue
     {
     private:
         using Node = inner_queue::LockFreeNode<T>;
@@ -137,12 +149,10 @@ namespace lock_free_container
             }
         }
 
-        // 入队
         template <typename... Args>
             requires std::constructible_from<T, Args...>
         bool enqueue(Args&&... args)
         {
-            // 1. 先用 Allocator 独立构造出数据 (T*)
             T* newData = ValueAllocTraits::allocate(valueAllocator_, 1);
             try
             {
@@ -154,7 +164,6 @@ namespace lock_free_container
                 throw;
             }
 
-            // 2. 把指针装载到 Node 中
             Node* newNode;
             try
             {
@@ -232,7 +241,7 @@ namespace lock_free_container
                         }
                         return false;
                     }
-                    // 帮助推进尾部（队列不为空但 tail 落后）
+                    // tail 落后，帮助推进
                     inner_queue::DoubleWord newTail(next, tail.tag + 1);
                     tail_.compare_exchange_strong(
                         tail, newTail,
@@ -243,13 +252,9 @@ namespace lock_free_container
                 {
                     if (POOL_UNLIKELY(next == nullptr))
                     {
-                        // 瞬态：head 已推进但 next 尚未发布
                         continue;
                     }
 
-                    // 在 CAS 之前，仅仅将指针读取出来。
-                    // 若线程此时被挂起，即使 next 被回收重用，ptr 悬垂指针也会因为后续 CAS 失败被丢弃，不会造成解引用
-                    // prefetch 下一个待出队节点
                     T* ptr = next->data;
                     POOL_PREFETCH_R(next->next.load(std::memory_order_relaxed));
 
@@ -259,7 +264,6 @@ namespace lock_free_container
                         std::memory_order_release,
                         std::memory_order_relaxed)))
                     {
-                        // CAS 成功，当前线程绝对占有了 ptr 数据，安全解引用
                         if (POOL_LIKELY(ptr))
                         {
                             data = std::move(*ptr);
@@ -267,7 +271,6 @@ namespace lock_free_container
                             ValueAllocTraits::deallocate(valueAllocator_, ptr, 1);
                         }
 
-                        // 延迟释放旧头节点
                         if (toDeallocate_)
                         {
                             deallocateNode(toDeallocate_);
