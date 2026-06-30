@@ -1,156 +1,217 @@
 # Thread-Pool
 
-基于 C++20 实现的无锁队列和线程池示例项目，项目核心代码位于 `pool/include`。
+基于 C++20 的无锁线程池库，header-only，无外部依赖。
 
 ## 目录结构
 
 ```text
-Thread-Pool/
-├── README.md
-├── LICENSE
-└── pool/
-    ├── include/
-    │   ├── lock_free_queue.hpp
-    │   ├── lock_free_thread_pool.hpp
-    │   └── lock_free_move_only_thread_pool.hpp
-    └── test/
-        ├── pool.cpp
-        └── test_move_only.cpp
+pool/include/
+├── lock_free_utility.hpp                 # 编译器内建宏与编译期工具
+├── lock_free_queue.hpp                   # Michael-Scott 链表无锁队列
+├── lock_free_ring_queue.hpp              # Vyukov 有界环形无锁队列
+├── lock_free_thread_pool_base.hpp        # CRTP 基类
+├── lock_free_dynamic_thread_pool.hpp     # std::function 线程池
+├── lock_free_move_only_thread_pool.hpp   # std::move_only_function 线程池 (C++23)
+├── lock_free_variant_thread_pool.hpp     # std::variant 线程池
+└── lock_free_thread_pool.hpp             # 汇总头（包含以上三种）
 ```
 
-## 功能说明
+## 快速开始
 
-### LockFreeQueue
+```cpp
+#include "lock_free_thread_pool.hpp"
 
-`lock_free_container::LockFreeQueue<T>` 是一个基于链表的无锁队列：
+// 4 线程池，自动推导硬件并发数
+thread_pool::DynamicThreadPool<> pool(4);
 
-- 使用原子操作完成入队和出队。
-- 通过带版本标记的头尾指针降低 ABA 问题风险。
-- 支持多线程并发 `enqueue` 和 `dequeue`。
-- 支持自定义分配器。
+// 提交任务，返回 std::future
+auto result = pool.submit([](int a, int b) { return a + b; }, 10, 20);
+std::cout << result.get();  // 30
+```
 
-常用接口：
+## 无锁队列
+
+### LockFreeQueue（链表，无界）
+
+Michael-Scott 算法，双字 CAS 防 ABA，`thread_local` 延迟释放防悬垂指针。
 
 ```cpp
 lock_free_container::LockFreeQueue<int> queue;
-
-queue.enqueue(1);
-queue.enqueue(2);
-
-int value = 0;
-if (queue.dequeue(value)) 
-{
-    // value == 1
-}
-
-bool isEmpty = queue.empty();
-queue.clear();
+queue.enqueue(42);
+int v; queue.dequeue(v);  // v = 42
 ```
 
-### LockFreeThreadPool
+> **注意**：`T` 必须默认可构造（内部哨兵节点需要）。
 
-`thread_pool::LockFreeThreadPool<>` 使用无锁队列保存任务，工作线程从队列中取出任务并执行：
+### LockFreeRingQueue（环形，有界）
 
-- `submit` 提交任意可调用对象，并返回 `std::future`。
-- `wait_all` 等待当前已提交任务执行完成。
-- `shutdown` 优雅关闭线程池。
-- `shutdown_now` 尝试立即关闭并清空未执行任务。
-- `active_count`、`total_count`、`completed_count`、`thread_count` 查询线程池状态。
-
-使用示例：
+Vyukov MPMC 算法，序列号法防 ABA，无需 128-bit CAS。缓存行对齐消除 false sharing。
 
 ```cpp
-#include "pool/include/lock_free_thread_pool.hpp"
-#include <iostream>
-
-int main() 
-{
-    thread_pool::LockFreeThreadPool<> pool(4);
-
-    auto result = pool.submit(int a, int b 
-	{
-       		return a + b;
-  	}, 10, 20);
-
-    std::cout << result.get() << '\n';
-    pool.wait_all();
-    pool.shutdown();
-}
+lock_free_container::LockFreeRingQueue<int, 1024> queue;  // 容量须为 2 的幂
+queue.enqueue(42);          // 满时返回 false
+int v; queue.dequeue(v);    // 空时返回 false
 ```
 
-### LockFreeMoveOnlyThreadPool
+> `T` 无需默认可构造。
 
-`thread_pool::LockFreeMoveOnlyThreadPool<>` 与 `LockFreeThreadPool` 功能相同，
-但内部使用 `std::move_only_function` 替代 `std::function`，从而支持 **move-only 任务**（例如捕获了不可复制资源的 lambda）。
+## 线程池变体
 
-- 所有接口（`submit`、`wait_all`、`shutdown` 等）与 `LockFreeThreadPool` 一致。
-- 任务类型可以是只移动的（如 `std::unique_ptr` 的捕获）。
-- 同样支持自定义分配器。
-- 需要 C++23 支持。
+三种变体均基于 CRTP 基类，零虚函数开销，均可通过模板参数替换底层队列。
 
-使用示例：
+### 1. DynamicThreadPool
+
+基于 `std::function<void()>`，最通用，支持任意可调用对象。
 
 ```cpp
-#include "pool/include/lock_free_move_only_thread_pool.hpp"
-#include <iostream>
-#include <memory>
+thread_pool::DynamicThreadPool<> pool(4);
 
-int main() 
-{
-    thread_pool::LockFreeMoveOnlyThreadPool<> pool(4);
+auto f1 = pool.submit([]{ return 42; });
+auto f2 = pool.submit([](int x){ return x * x; }, 5);
 
-    auto result = pool.submit(std::unique_ptr<int> p 
-	{
-       		return *p + 10;
-   	}, std::make_unique<int>(32));
-
-    std::cout << result.get() << '\n'; // 输出 42
-    pool.wait_all();
-    pool.shutdown();
-}
+// 向后兼容别名
+thread_pool::LockFreeThreadPool<> pool2(2);
 ```
 
-## 编译和运行测试
+#### 模板参数
 
-项目使用 C++20 标准。可以在仓库根目录执行：
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型 |
+| `TaskAllocator` | `std::allocator<std::function<void()>>` | 任务内存分配器 |
+
+### 2. DynamicMoveOnlyThreadPool（C++23）
+
+基于 `std::move_only_function<void()>`，支持捕获 `std::unique_ptr` 等 move-only 对象。
+
+```cpp
+thread_pool::DynamicMoveOnlyThreadPool<> pool(4);
+
+auto ptr = std::make_unique<int>(42);
+auto fut = pool.submit([p = std::move(ptr)] { return *p; });
+
+// 向后兼容别名
+thread_pool::LockFreeMoveOnlyThreadPool<> pool2(2);
+```
+
+#### 模板参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型 |
+| `TaskAllocator` | `std::allocator<std::move_only_function<void()>>` | 任务内存分配器 |
+
+### 3. VariantThreadPool
+
+基于 `std::variant<PackagedTasks...>` 消除运行时类型擦除，`std::visit` 编译期跳转表替代虚函数分发。
+
+```cpp
+using TaskVariant = std::variant<
+    std::packaged_task<void()>,
+    std::packaged_task<int()>,
+    std::packaged_task<std::string()>,
+    std::function<void()>         // 兜底类型
+>;
+
+thread_pool::VariantThreadPool<TaskVariant> pool(4);
+auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
+```
+
+#### 模板参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `VariantType` | 无 | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
+| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
+| `TaskAllocator` | `std::allocator<VariantType>` | 任务内存分配器 |
+
+## 替换队列类型
+
+所有线程池均支持通过模板参数指定底层队列实现：
+
+```cpp
+// 使用环形队列
+using RingQ = lock_free_container::LockFreeRingQueue<
+    std::function<void()>, 256>;
+
+thread_pool::DynamicThreadPool<RingQ> pool(4);
+```
+
+## API 参考
+
+### 公共接口（所有线程池）
+
+| 方法 | 说明 |
+|------|------|
+| `submit(Func&&, Args&&...)` | 提交任务，返回 `std::future<ReturnType>` |
+| `wait_all()` | 等待所有活跃任务完成 |
+| `shutdown()` | 优雅关闭：等待进行中任务完成，不再接受新任务 |
+| `shutdown_now()` | 立即关闭：丢弃未执行任务，等待进行中任务完成 |
+| `active_count()` | 当前活跃（排队中 + 执行中）任务数 |
+| `total_count()` | 历史提交总数 |
+| `completed_count()` | 已完成任务数 |
+| `thread_count()` | 工作线程数 |
+
+### 构造参数
+
+```cpp
+// num_threads: 工作线程数（默认硬件并发数）
+// queue:       任务队列实例（默认构造）
+DynamicThreadPool(
+    std::size_t num_threads = std::thread::hardware_concurrency(),
+    QueueType queue = QueueType()
+);
+```
+
+## 构建与测试
+
+### CMake（推荐）
 
 ```bash
-# 测试 LockFreeThreadPool（test.cpp）
-g++ -std=c++20 -O2 -pthread test.cpp -o test
-./test
-
-# 测试 LockFreeMoveOnlyThreadPool（test_move_only.cpp）
-g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only
-./test_move_only
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j$(nproc)
+ctest --output-on-failure
 ```
 
+> GoogleTest 通过 FetchContent 自动下载（v1.15.2）。
 
+### 手动编译
 
 ```bash
-g++ -std=c++20 -O2 -pthread test.cpp -o test -latomic
-g++ -std=c++20 -O2 -pthread test_move_only.cpp -o test_move_only -latomic
+# 基础测试（C++20）
+g++ -std=c++20 -O2 -pthread pool/test/test_queue.cpp -o test_queue -latomic
+
+# move_only 测试（C++23）
+g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -latomic
 ```
 
-## 测试内容
+> 某些 x86-64 平台需 `-latomic`（128 位原子操作）。
 
-### `test.cpp`
-覆盖以下内容：
-- 单线程队列 FIFO 顺序。
-- 空队列出队行为。
-- 多生产者、多消费者并发入队出队。
-- 线程池任务返回值。
-- 线程池批量任务执行。
-- 线程池异常任务不会导致工作线程退出。
-- 线程池任务统计计数。
+## 性能
 
-### `test_move_only.cpp`
-与 `test.cpp` 的测试用例完全一致，但使用的是 `LockFreeMoveOnlyThreadPool`，验证 move-only 任务的支持情况。
+以下数据基于 12 核 CPU，GCC 15.2，-O3：
 
-## 注意事项
+| 场景 | 有锁线程池 | function | move_only | variant | 最佳加速比 |
+|------|-----------|----------|-----------|---------|-----------|
+| 轻量任务 (50000) | 316 ms | 301 ms | 262 ms | 221 ms | **1.42×** |
+| 重量任务 (200) | 15 ms | 4 ms | 4 ms | 3 ms | **5.17×** |
+| IO 混合 (2000) | 20 ms | 19 ms | 19 ms | 19 ms | 1.04× |
 
-- `LockFreeQueue<T>` 当前实现会创建一个哨兵节点，因此 `T` 需要支持默认构造。
-- 线程池析构时会调用 `shutdown`，也可以手动调用 `shutdown` 提前关闭。
-- `LockFreeMoveOnlyThreadPool` 要求编译器支持 `<move_only_function>`（C++23 特性，部分 C++20 库也已提供），请确保编译环境符合要求。
+> 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
 
----
+### 性能说明
 
+- **轻量任务**：VariantThreadPool 因编译期分发消除了 `std::function` 的类型擦除开销，性能最优；move_only 略优于 function。
+- **重量任务**：任务执行时间远大于调度开销，三种无锁变体均远超有锁线程池，VariantThreadPool 可达 **5×** 加速。
+- **IO 混合**：瓶颈在 IO 等待而非调度，各实现差异不大。
+
+## 编译器要求
+
+- C++20（DynamicThreadPool、VariantThreadPool）
+- C++23（DynamicMoveOnlyThreadPool，需 `<move_only_function>`）
+- 支持 GCC 15+、Clang 21+、MSVC 2022+
+
+## 许可证
+
+MIT License — 详见 [LICENSE](LICENSE)。

@@ -1,0 +1,123 @@
+#pragma once
+// ============================================================
+// lock_free_variant_thread_pool.hpp — std::variant 线程池
+// ============================================================
+// 使用 std::variant<PackagedTasks...> 消除运行时类型擦除，
+// std::visit 编译期跳转表替代虚函数分发。
+// 适用于需要零开销任务分发的场景。
+//
+// 用法：
+//   using MyVariant = std::variant<
+//       std::packaged_task<void()>,
+//       std::packaged_task<int()>,
+//       std::function<void()>   // 兜底类型
+//   >;
+//   VariantThreadPool<MyVariant> pool(4);
+//   auto fut = pool.submit([] { return 42; });
+// ============================================================
+
+#include "lock_free_queue.hpp"
+#include "lock_free_thread_pool_base.hpp"
+#include "lock_free_utility.hpp"
+
+#include <functional>
+#include <future>
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+namespace thread_pool
+{
+
+template <typename VariantType,
+          typename QueueType =
+              lock_free_container::LockFreeQueue<VariantType>,
+          typename TaskAllocator = std::allocator<VariantType>>
+class VariantThreadPool
+    : public LockFreeThreadPoolBase<VariantType,
+                                    VariantThreadPool<VariantType,
+                                                      QueueType,
+                                                      TaskAllocator>,
+                                    QueueType, TaskAllocator>
+{
+    using Base =
+        LockFreeThreadPoolBase<VariantType,
+                               VariantThreadPool<VariantType,
+                                                 QueueType,
+                                                 TaskAllocator>,
+                               QueueType, TaskAllocator>;
+    friend Base;
+
+public:
+    using Base::Base;
+
+    // ---- 提交任务 ----
+    // 编译期根据返回类型选择 variant 中对应的 packaged_task 候选项
+    template <typename Func, typename... Args>
+    auto submit(Func&& func, Args&&... args)
+        -> std::future<
+            typename std::invoke_result<Func, Args...>::type>
+    {
+        using ReturnType =
+            typename std::invoke_result<Func, Args...>::type;
+        using PackagedTask = std::packaged_task<ReturnType()>;
+
+        if constexpr (is_in_variant_v<PackagedTask, VariantType>)
+        {
+            // 直接路径：零类型擦除
+            constexpr std::size_t idx =
+                variant_index_v<PackagedTask, VariantType>;
+
+            PackagedTask pt(
+                std::bind(std::forward<Func>(func),
+                          std::forward<Args>(args)...));
+            std::future<ReturnType> result = pt.get_future();
+
+            this->enqueue_task(
+                VariantType(std::in_place_index<idx>,
+                            std::move(pt)));
+            return result;
+        }
+        else if constexpr (is_in_variant_v<std::function<void()>,
+                                           VariantType>)
+        {
+            // 回退路径：std::function<void()> 包装
+            constexpr std::size_t idx =
+                variant_index_v<std::function<void()>,
+                                VariantType>;
+
+            auto pt = std::make_shared<PackagedTask>(
+                std::bind(std::forward<Func>(func),
+                          std::forward<Args>(args)...));
+            std::future<ReturnType> result = pt->get_future();
+
+            this->enqueue_task(
+                VariantType(std::in_place_index<idx>,
+                            std::function<void()>(
+                                [pt]()
+                                { (*pt)(); })));
+            return result;
+        }
+        else
+        {
+            // 编译期报错：返回类型未被 variant 覆盖
+            static_assert(
+                sizeof(ReturnType) == 0,
+                "Return type not covered by variant. Add "
+                "std::packaged_task<Ret()> to the variant, or "
+                "include std::function<void()> as fallback.");
+        }
+    }
+
+private:
+    void execute_task(VariantType&& task)
+    {
+        std::visit(
+            [](auto&& t)
+            { std::forward<decltype(t)>(t)(); },
+            std::move(task));
+    }
+};
+
+}  // namespace thread_pool

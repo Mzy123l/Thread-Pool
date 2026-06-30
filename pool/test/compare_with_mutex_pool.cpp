@@ -11,9 +11,11 @@
 #include <future>
 #include <thread>
 #include <atomic>
+#include <variant>
 
 #include "../include/lock_free_thread_pool.hpp"          // 基于 std::function
 #include "../include/lock_free_move_only_thread_pool.hpp" // 基于 move_only_function
+#include "../include/lock_free_variant_thread_pool.hpp"   // 基于 std::variant
 
 // ======================== 有锁线程池 ========================
 class LockBasedThreadPool
@@ -174,6 +176,14 @@ std::vector<std::function<void()>> generate_tasks(TaskType type, size_t count)
     return tasks;
 }
 
+// ======================== VariantThreadPool 基准测试类型 ========================
+using BenchVariant = std::variant<
+    std::packaged_task<void()>,
+    std::packaged_task<int()>,
+    std::packaged_task<long long()>,
+    std::function<void()>   // 兜底类型
+>;
+
 // ======================== main ========================
 int main()
 {
@@ -195,12 +205,13 @@ int main()
     LockBasedThreadPool lockPool(NUM_THREADS);
     thread_pool::LockFreeThreadPool<> freePool1(NUM_THREADS);
     thread_pool::LockFreeMoveOnlyThreadPool<> freePool2(NUM_THREADS);
+    thread_pool::VariantThreadPool<BenchVariant> freePool3(NUM_THREADS);
 
     // 存储结果
     struct ScenarioResult
     {
         std::string name;
-        double lock_time, free_func_time, free_move_time;
+        double lock_time, free_func_time, free_move_time, free_variant_time;
     };
     std::vector<ScenarioResult> results;
 
@@ -214,8 +225,10 @@ int main()
         auto r_free1 = run_test(freePool1, tasks, WARMUP);
         // 无锁 move_only_function
         auto r_free2 = run_test(freePool2, tasks, WARMUP);
+        // 无锁 variant
+        auto r_free3 = run_test(freePool3, tasks, WARMUP);
 
-        results.push_back({ name, r_lock.time_ms, r_free1.time_ms, r_free2.time_ms });
+        results.push_back({ name, r_lock.time_ms, r_free1.time_ms, r_free2.time_ms, r_free3.time_ms });
 
         std::cout << name << ":\n";
         std::cout << "  有锁线程池:       " << r_lock.time_ms << " ms, 吞吐量 "
@@ -223,7 +236,9 @@ int main()
         std::cout << "  无锁(function):   " << r_free1.time_ms << " ms, 吞吐量 "
             << r_free1.throughput_per_sec << " tasks/s\n";
         std::cout << "  无锁(move_only):  " << r_free2.time_ms << " ms, 吞吐量 "
-            << r_free2.throughput_per_sec << " tasks/s\n\n";
+            << r_free2.throughput_per_sec << " tasks/s\n";
+        std::cout << "  无锁(variant):    " << r_free3.time_ms << " ms, 吞吐量 "
+            << r_free3.throughput_per_sec << " tasks/s\n\n";
         };
 
     test_scenario("轻量任务", TaskType::LIGHT, LIGHT_COUNT);
@@ -232,20 +247,21 @@ int main()
 
     // 打印汇总对比表
     std::cout << "\n========== 性能对比汇总 (耗时 ms) ==========\n";
-    printf("%-20s %12s %12s %12s\n", "场景", "有锁", "无锁(function)", "无锁(move_only)");
+    printf("%-20s %12s %12s %12s %12s\n", "场景", "有锁", "无锁(function)", "无锁(move_only)", "无锁(variant)");
     for (const auto& r : results)
     {
-        printf("%-20s %12.2f %12.2f %12.2f\n", r.name.c_str(), r.lock_time, r.free_func_time, r.free_move_time);
+        printf("%-20s %12.2f %12.2f %12.2f %12.2f\n", r.name.c_str(), r.lock_time, r.free_func_time, r.free_move_time, r.free_variant_time);
     }
 
     // 计算加速比（相对于有锁）
     std::cout << "\n========== 加速比 (相对于有锁) ==========\n";
-    printf("%-20s %12s %12s\n", "场景", "无锁(function)", "无锁(move_only)");
+    printf("%-20s %12s %12s %12s\n", "场景", "无锁(function)", "无锁(move_only)", "无锁(variant)");
     for (const auto& r : results)
     {
         double speedup1 = r.lock_time / r.free_func_time;
         double speedup2 = r.lock_time / r.free_move_time;
-        printf("%-20s %12.2fx %12.2fx\n", r.name.c_str(), speedup1, speedup2);
+        double speedup3 = r.lock_time / r.free_variant_time;
+        printf("%-20s %12.2fx %12.2fx %12.2fx\n", r.name.c_str(), speedup1, speedup2, speedup3);
     }
 
     return 0;

@@ -1,11 +1,9 @@
 #pragma once
 // ============================================================
-// lock_free_move_only_thread_pool.hpp — move_only_function 线程池
+// lock_free_dynamic_thread_pool.hpp — std::function 线程池
 // ============================================================
-// 使用 std::move_only_function<void()> 进行类型擦除，支持捕获
-// move-only 对象（如 std::unique_ptr）。
-// 需要 C++23 或支持 __cpp_lib_move_only_function 的编译器。
-// 可通过 QueueType 模板参数替换底层队列实现。
+// 使用 std::function<void()> 进行类型擦除，支持任意可调用对象 +
+// 参数绑定。可通过 QueueType 模板参数替换底层队列实现。
 // ============================================================
 
 #include "lock_free_queue.hpp"
@@ -16,34 +14,33 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
-#include <version>
-
-#if defined(__cpp_lib_move_only_function) || defined(_MSC_VER)
 
 namespace thread_pool
 {
 
 template <
     typename QueueType =
-        lock_free_container::LockFreeQueue<
-            std::move_only_function<void()>>,
-    typename TaskAllocator =
-        std::allocator<std::move_only_function<void()>>>
-class DynamicMoveOnlyThreadPool
-    : public LockFreeThreadPoolBase<
-          std::move_only_function<void()>,
-          DynamicMoveOnlyThreadPool<QueueType, TaskAllocator>,
-          QueueType, TaskAllocator>
+        lock_free_container::LockFreeQueue<std::function<void()>>,
+    typename TaskAllocator = std::allocator<std::function<void()>>>
+class DynamicThreadPool
+    : public LockFreeThreadPoolBase<std::function<void()>,
+                                    DynamicThreadPool<QueueType,
+                                                      TaskAllocator>,
+                                    QueueType, TaskAllocator>
 {
-    using Base = LockFreeThreadPoolBase<
-        std::move_only_function<void()>,
-        DynamicMoveOnlyThreadPool<QueueType, TaskAllocator>,
-        QueueType, TaskAllocator>;
+    using Base =
+        LockFreeThreadPoolBase<std::function<void()>,
+                               DynamicThreadPool<QueueType,
+                                                 TaskAllocator>,
+                               QueueType, TaskAllocator>;
     friend Base;
 
 public:
     using Base::Base;
 
+    // ---- 提交任务 ----
+    // 将可调用对象 + 参数包装为 std::function<void()> 后入队，
+    // 返回 std::future<ReturnType>
     template <typename Func, typename... Args>
     auto submit(Func&& func, Args&&... args)
         -> std::future<
@@ -63,7 +60,7 @@ public:
 
         std::future<ReturnType> result = task->get_future();
 
-        std::move_only_function<void()> wrapper = [task]()
+        std::function<void()> wrapper = [task]()
         { (*task)(); };
 
         this->enqueue_task(std::move(wrapper));
@@ -71,22 +68,17 @@ public:
     }
 
 private:
-    void execute_task(std::move_only_function<void()>&& task)
+    void execute_task(std::function<void()>&& task)
     {
         task();
     }
 };
 
 // 向后兼容别名
-template <
-    typename TaskAllocator =
-        std::allocator<std::move_only_function<void()>>>
-using LockFreeMoveOnlyThreadPool =
-    DynamicMoveOnlyThreadPool<
-        lock_free_container::LockFreeQueue<
-            std::move_only_function<void()>>,
-        TaskAllocator>;
+template <typename TaskAllocator = std::allocator<std::function<void()>>>
+using LockFreeThreadPool =
+    DynamicThreadPool<lock_free_container::LockFreeQueue<
+                          std::function<void()>>,
+                      TaskAllocator>;
 
 }  // namespace thread_pool
-
-#endif  // __cpp_lib_move_only_function
