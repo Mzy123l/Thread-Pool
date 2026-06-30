@@ -71,6 +71,11 @@ template <typename T,
           typename Allocator = inner_ring::DefaultAllocator<T>>
 class LockFreeRingQueue
 {
+public:
+    /// @brief 分配器类型（队列元素 T 的分配器）
+    using allocator_type = Allocator;
+
+private:
     static_assert(Capacity > 0, "Capacity 必须 > 0");
     static_assert((Capacity & (Capacity - 1)) == 0,
                   "Capacity 必须是 2 的幂");

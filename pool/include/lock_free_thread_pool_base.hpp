@@ -10,6 +10,11 @@
 //
 // 派生类仅需实现 submit() 和 execute_task() 两个方法。
 // 通过 CRTP 实现编译期多态，零虚函数开销。
+//
+// 分配器设计参照 std::priority_queue：
+//   - allocator_type 从底层队列类型推导
+//   - 构造时透传分配器实例给队列
+//   - 与队列共享同一分配器（经 rebind 用于 packaged_task）
 // ============================================================
 
 #include "lock_free_queue.hpp"
@@ -32,28 +37,31 @@ namespace thread_pool
 // LockFreeThreadPoolBase — CRTP 基类
 // ============================================================
 // 模板参数：
-//   FuncType     — 队列元素类型（std::function<void()>、variant 等）
-//   Derived      — CRTP 后代类（编译期多态）
-//   QueueType    — 无锁队列类型，默认 LockFreeQueue<FuncType>
-//   TaskAllocator— FuncType 的分配器类型
+//   FuncType  — 队列元素类型（std::function<void()>、variant 等）
+//   Derived   — CRTP 后代类（编译期多态）
+//   QueueType — 无锁队列类型，默认 LockFreeQueue<FuncType>
+//               分配器类型从 QueueType::allocator_type 推导
 // ============================================================
 template <typename FuncType, typename Derived,
           typename QueueType =
-              lock_free_container::LockFreeQueue<FuncType>,
-          typename TaskAllocator = std::allocator<FuncType>>
+              lock_free_container::LockFreeQueue<FuncType>>
 class LockFreeThreadPoolBase
 {
 public:
     using Task = FuncType;
 
+    /// @brief 分配器类型，从队列类型推导（同 std::priority_queue 约定）
+    using allocator_type = typename QueueType::allocator_type;
+
     // ---- 构造 ----
     // @param num_threads 工作线程数（默认 = 硬件并发数）
-    // @param queue       已构造的任务队列（默认构造）
+    // @param alloc       分配器实例，透传给底层队列
     explicit LockFreeThreadPoolBase(
-        std::size_t num_threads = std::thread::hardware_concurrency(),
-        QueueType queue = QueueType())
-        : task_queue_(std::move(queue)), stop_{false}, active_tasks_{0},
-          total_tasks_{0}, completed_tasks_{0}
+        std::size_t num_threads =
+            std::thread::hardware_concurrency(),
+        const allocator_type& alloc = allocator_type())
+        : task_queue_(alloc), task_allocator_(alloc), stop_{false},
+          active_tasks_{0}, total_tasks_{0}, completed_tasks_{0}
     {
         workers_.reserve(num_threads);
         for (std::size_t i = 0; i < num_threads; ++i)
@@ -147,6 +155,12 @@ public:
         return workers_.size();
     }
 
+    /// @brief 获取分配器副本（同 std::priority_queue 约定）
+    allocator_type get_allocator() const noexcept
+    {
+        return task_allocator_;
+    }
+
 protected:
     // ---- 入队任务（供派生类 submit() 调用） ----
     // 重试语义：有界队列满时自旋等待。
@@ -163,13 +177,15 @@ protected:
     }
 
     // 数据成员（protected 允许派生类访问）
+    // 注意：task_allocator_ 必须在 task_queue_ 之后声明，
+    // 因为分配器由队列构造时同步初始化
     QueueType task_queue_;
+    allocator_type task_allocator_;
     std::vector<std::thread> workers_;
     std::atomic<bool> stop_;
     std::atomic<std::size_t> active_tasks_;
     std::atomic<std::size_t> total_tasks_;
     std::atomic<std::size_t> completed_tasks_;
-    TaskAllocator task_allocator_;
 
 private:
     // ---- 工作线程主循环 ----
