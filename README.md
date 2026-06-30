@@ -121,7 +121,7 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `VariantType` | （必填） | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
+| `VariantType` | 无 | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
 | `TaskAllocator` | `std::allocator<VariantType>` | 任务内存分配器 |
 
@@ -194,9 +194,9 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 | 场景 | 有锁线程池 | function | move_only | variant | 最佳加速比 |
 |------|-----------|----------|-----------|---------|-----------|
-| 轻量任务 (50000) | 301 ms | 316 ms | 262 ms | 221 ms | **1.36×** |
+| 轻量任务 (50000) | 316 ms | 301 ms | 262 ms | 221 ms | **1.42×** |
 | 重量任务 (200) | 15 ms | 4 ms | 4 ms | 3 ms | **5.17×** |
-| IO 混合 (2000) | 18 ms | 19 ms | 19 ms | 19 ms | 1.04× |
+| IO 混合 (2000) | 20 ms | 19 ms | 19 ms | 19 ms | 1.04× |
 
 > 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
 
