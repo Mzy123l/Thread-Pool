@@ -6,6 +6,8 @@
 // move-only 对象（如 std::unique_ptr）。
 // 需要 C++23 或支持 __cpp_lib_move_only_function 的编译器。
 // 可通过 QueueType 模板参数替换底层队列实现。
+// 分配器类型从 QueueType::allocator_type 推导，
+// 参照 std::priority_queue 设计。
 // ============================================================
 
 #include "lock_free_queue.hpp"
@@ -26,19 +28,17 @@ namespace thread_pool
 template <
     typename QueueType =
         lock_free_container::LockFreeQueue<
-            std::move_only_function<void()>>,
-    typename TaskAllocator =
-        std::allocator<std::move_only_function<void()>>>
+            std::move_only_function<void()>>>
 class DynamicMoveOnlyThreadPool
     : public LockFreeThreadPoolBase<
           std::move_only_function<void()>,
-          DynamicMoveOnlyThreadPool<QueueType, TaskAllocator>,
-          QueueType, TaskAllocator>
+          DynamicMoveOnlyThreadPool<QueueType>,
+          QueueType>
 {
     using Base = LockFreeThreadPoolBase<
         std::move_only_function<void()>,
-        DynamicMoveOnlyThreadPool<QueueType, TaskAllocator>,
-        QueueType, TaskAllocator>;
+        DynamicMoveOnlyThreadPool<QueueType>,
+        QueueType>;
     friend Base;
 
 public:
@@ -54,7 +54,8 @@ public:
         using PackagedTask = std::packaged_task<ReturnType()>;
         using PackagedTaskAllocator =
             typename std::allocator_traits<
-                TaskAllocator>::template rebind_alloc<PackagedTask>;
+                typename Base::allocator_type>::
+                template rebind_alloc<PackagedTask>;
 
         auto task = std::allocate_shared<PackagedTask>(
             PackagedTaskAllocator(this->task_allocator_),
@@ -78,14 +79,14 @@ private:
 };
 
 // 向后兼容别名
+// 用户可指定分配器：LockFreeMoveOnlyThreadPool<MyAlloc>
 template <
-    typename TaskAllocator =
+    typename Alloc =
         std::allocator<std::move_only_function<void()>>>
 using LockFreeMoveOnlyThreadPool =
     DynamicMoveOnlyThreadPool<
         lock_free_container::LockFreeQueue<
-            std::move_only_function<void()>>,
-        TaskAllocator>;
+            std::move_only_function<void()>, Alloc>>;
 
 }  // namespace thread_pool
 

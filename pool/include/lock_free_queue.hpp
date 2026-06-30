@@ -94,6 +94,10 @@ template <typename T,
           typename Allocator = inner_queue::DefaultAllocator<T>>
 class LockFreeQueue
     {
+    public:
+        /// @brief 分配器类型（队列元素 T 的分配器）
+        using allocator_type = Allocator;
+
     private:
         using Node = inner_queue::LockFreeNode<T>;
         using NodeAllocator = typename std::allocator_traits<Allocator>::template rebind_alloc<Node>;
@@ -299,7 +303,13 @@ class LockFreeQueue
                 headPtr->next.load(std::memory_order_acquire) == nullptr;
         }
 
-        NodeAllocator getAllocator() const noexcept
+        /// @brief 获取队列的数据分配器副本（同 std::priority_queue 约定）
+        allocator_type get_allocator() const noexcept
+        {
+            return valueAllocator_;
+        }
+
+        NodeAllocator getNodeAllocator() const noexcept
         {
             return allocator_;
         }

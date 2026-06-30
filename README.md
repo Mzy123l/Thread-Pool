@@ -41,7 +41,13 @@ queue.enqueue(42);
 int v; queue.dequeue(v);  // v = 42
 ```
 
-> **注意**：`T` 必须默认可构造（内部哨兵节点需要）。
+| 模板参数 | 默认值 | 说明 |
+|----------|--------|------|
+| `T` | — | 元素类型（须默认可构造） |
+| `Allocator` | `DefaultAllocator<T>` | 分配器，暴露为 `allocator_type` |
+
+> `T` 必须默认可构造（内部哨兵节点需要）。  
+> 分配器副本通过 `get_allocator()` 获取。
 
 ### LockFreeRingQueue（环形，有界）
 
@@ -53,7 +59,14 @@ queue.enqueue(42);          // 满时返回 false
 int v; queue.dequeue(v);    // 空时返回 false
 ```
 
-> `T` 无需默认可构造。
+| 模板参数 | 默认值 | 说明 |
+|----------|--------|------|
+| `T` | — | 元素类型 |
+| `Capacity` | — | 容量（须为 2 的幂） |
+| `Allocator` | `DefaultAllocator<T>` | 分配器，暴露为 `allocator_type` |
+
+> `T` 无需默认可构造。  
+> 分配器副本通过 `get_allocator()` 获取。
 
 ## 线程池变体
 
@@ -77,8 +90,20 @@ thread_pool::LockFreeThreadPool<> pool2(2);
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型 |
-| `TaskAllocator` | `std::allocator<std::function<void()>>` | 任务内存分配器 |
+| `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型，分配器从 `QueueType::allocator_type` 推导 |
+
+分配器类型从队列类型推导（同 `std::priority_queue` 设计）。
+若需自定义分配器，将其嵌入队列类型：
+
+```cpp
+// 方式一：通过向后兼容别名
+thread_pool::LockFreeThreadPool<MyAllocator> pool(4);
+
+// 方式二：直接指定队列类型
+using MyQueue = lock_free_container::LockFreeQueue<
+    std::function<void()>, MyAllocator>;
+thread_pool::DynamicThreadPool<MyQueue> pool(4, my_allocator);
+```
 
 ### 2. DynamicMoveOnlyThreadPool（C++23）
 
@@ -98,8 +123,7 @@ thread_pool::LockFreeMoveOnlyThreadPool<> pool2(2);
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型 |
-| `TaskAllocator` | `std::allocator<std::move_only_function<void()>>` | 任务内存分配器 |
+| `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型，分配器从 `QueueType::allocator_type` 推导 |
 
 ### 3. VariantThreadPool
 
@@ -122,12 +146,11 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `VariantType` | （必填） | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
-| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
-| `TaskAllocator` | `std::allocator<VariantType>` | 任务内存分配器 |
+| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型，分配器从 `QueueType::allocator_type` 推导 |
 
-## 替换队列类型
+## 替换队列与分配器
 
-所有线程池均支持通过模板参数指定底层队列实现：
+所有线程池均支持通过模板参数指定底层队列实现，分配器可嵌入队列类型：
 
 ```cpp
 // 使用环形队列
@@ -135,6 +158,22 @@ using RingQ = lock_free_container::LockFreeRingQueue<
     std::function<void()>, 256>;
 
 thread_pool::DynamicThreadPool<RingQ> pool(4);
+```
+
+使用自定义分配器（需在队列类型中指定）：
+
+```cpp
+// 自定义分配器
+template <typename T>
+struct MyAlloc : std::allocator<T> { /* ... */ };
+
+// 嵌入队列类型
+using MyQueue = lock_free_container::LockFreeQueue<
+    std::function<void()>, MyAlloc<std::function<void()>>>;
+
+// 传递分配器实例
+MyAlloc<std::function<void()>> alloc;
+thread_pool::DynamicThreadPool<MyQueue> pool(4, alloc);
 ```
 
 ## API 参考
@@ -151,17 +190,22 @@ thread_pool::DynamicThreadPool<RingQ> pool(4);
 | `total_count()` | 历史提交总数 |
 | `completed_count()` | 已完成任务数 |
 | `thread_count()` | 工作线程数 |
+| `get_allocator()` | 获取分配器副本（同 `std::priority_queue` 约定） |
 
 ### 构造参数
 
 ```cpp
 // num_threads: 工作线程数（默认硬件并发数）
-// queue:       任务队列实例（默认构造）
+// alloc:       分配器实例，透传给底层队列（默认构造）
 DynamicThreadPool(
     std::size_t num_threads = std::thread::hardware_concurrency(),
-    QueueType queue = QueueType()
+    const allocator_type& alloc = allocator_type()
 );
 ```
+
+分配器同时用于：
+- 底层队列的节点和数据内存分配
+- `submit()` 中 `packaged_task` 的内存分配（经 `allocator_traits::rebind`）
 
 ## 构建与测试
 

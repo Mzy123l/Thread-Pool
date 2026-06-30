@@ -5,6 +5,8 @@
 // 使用 std::variant<PackagedTasks...> 消除运行时类型擦除，
 // std::visit 编译期跳转表替代虚函数分发。
 // 适用于需要零开销任务分发的场景。
+// 分配器类型从 QueueType::allocator_type 推导，
+// 参照 std::priority_queue 设计。
 //
 // 用法：
 //   using MyVariant = std::variant<
@@ -32,21 +34,18 @@ namespace thread_pool
 
 template <typename VariantType,
           typename QueueType =
-              lock_free_container::LockFreeQueue<VariantType>,
-          typename TaskAllocator = std::allocator<VariantType>>
+              lock_free_container::LockFreeQueue<VariantType>>
 class VariantThreadPool
     : public LockFreeThreadPoolBase<VariantType,
                                     VariantThreadPool<VariantType,
-                                                      QueueType,
-                                                      TaskAllocator>,
-                                    QueueType, TaskAllocator>
+                                                      QueueType>,
+                                    QueueType>
 {
     using Base =
         LockFreeThreadPoolBase<VariantType,
                                VariantThreadPool<VariantType,
-                                                 QueueType,
-                                                 TaskAllocator>,
-                               QueueType, TaskAllocator>;
+                                                 QueueType>,
+                               QueueType>;
     friend Base;
 
 public:

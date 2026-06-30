@@ -4,6 +4,8 @@
 // ============================================================
 // 使用 std::function<void()> 进行类型擦除，支持任意可调用对象 +
 // 参数绑定。可通过 QueueType 模板参数替换底层队列实现。
+// 分配器类型从 QueueType::allocator_type 推导，
+// 参照 std::priority_queue 设计。
 // ============================================================
 
 #include "lock_free_queue.hpp"
@@ -20,19 +22,16 @@ namespace thread_pool
 
 template <
     typename QueueType =
-        lock_free_container::LockFreeQueue<std::function<void()>>,
-    typename TaskAllocator = std::allocator<std::function<void()>>>
+        lock_free_container::LockFreeQueue<std::function<void()>>>
 class DynamicThreadPool
     : public LockFreeThreadPoolBase<std::function<void()>,
-                                    DynamicThreadPool<QueueType,
-                                                      TaskAllocator>,
-                                    QueueType, TaskAllocator>
+                                    DynamicThreadPool<QueueType>,
+                                    QueueType>
 {
     using Base =
         LockFreeThreadPoolBase<std::function<void()>,
-                               DynamicThreadPool<QueueType,
-                                                 TaskAllocator>,
-                               QueueType, TaskAllocator>;
+                               DynamicThreadPool<QueueType>,
+                               QueueType>;
     friend Base;
 
 public:
@@ -51,7 +50,8 @@ public:
         using PackagedTask = std::packaged_task<ReturnType()>;
         using PackagedTaskAllocator =
             typename std::allocator_traits<
-                TaskAllocator>::template rebind_alloc<PackagedTask>;
+                typename Base::allocator_type>::
+                template rebind_alloc<PackagedTask>;
 
         auto task = std::allocate_shared<PackagedTask>(
             PackagedTaskAllocator(this->task_allocator_),
@@ -75,10 +75,13 @@ private:
 };
 
 // 向后兼容别名
-template <typename TaskAllocator = std::allocator<std::function<void()>>>
+// 用户可指定分配器：LockFreeThreadPool<MyAlloc>
+// 等价于 DynamicThreadPool<LockFreeQueue<Func, MyAlloc>>
+template <
+    typename Alloc =
+        std::allocator<std::function<void()>>>
 using LockFreeThreadPool =
     DynamicThreadPool<lock_free_container::LockFreeQueue<
-                          std::function<void()>>,
-                      TaskAllocator>;
+        std::function<void()>, Alloc>>;
 
 }  // namespace thread_pool
