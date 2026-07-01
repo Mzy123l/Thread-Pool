@@ -93,7 +93,7 @@ thread_pool::LockFreeThreadPool pool2(2);
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量模式（预留） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 分配器类型从 `QueueType::allocator_type` 推导（同 `std::priority_queue` 设计）：
@@ -104,9 +104,9 @@ using MyQueue = lock_free_container::LockFreeQueue<
     std::function<void()>, MyAllocator>;
 thread_pool::DynamicThreadPool<MyQueue> pool(4, my_allocator);
 
-// 启用批量入队 + CPU 亲和性
+// 启用 CPU 亲和性
 thread_pool::DynamicThreadPool<MyQueue,
-    thread_pool::BatchMode::Enabled,
+    thread_pool::BatchMode::Disabled,
     thread_pool::AffinityMode::Enabled> pool(4, my_allocator);
 ```
 
@@ -129,7 +129,7 @@ thread_pool::LockFreeMoveOnlyThreadPool pool2(2);
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量模式（预留） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ### 3. VariantThreadPool
@@ -154,7 +154,7 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 |------|--------|------|
 | `VariantType` | — | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量模式（预留） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ### 4. StrictVariantThreadPool
@@ -184,7 +184,7 @@ std::cout << fut.get();  // 42
 |------|--------|------|
 | `VariantType` | — | 任务 variant 类型，须包含对应返回类型的 `StaticPackagedTask<T()>` |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量模式（预留） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 > 与 VariantThreadPool 的核心区别：自实现 task/future/function 替代 `std::packaged_task`/
@@ -346,7 +346,7 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 | 选项 | 枚举值 | 说明 |
 |------|--------|------|
-| `BatchMode` | `Disabled`（默认）/ `Enabled` | 将任务聚合为批次一次性入队，减少 CAS 次数 |
+| `BatchMode` | `Disabled`（默认）/ `Enabled` | 批量模式（预留扩展，当前为 no-op） |
 | `AffinityMode` | `Disabled`（默认）/ `Enabled` | Linux 下 `pthread_setaffinity_np` 绑定线程到不同核心 |
 
 ```cpp
@@ -358,7 +358,7 @@ using MyVariant = std::variant<
 using MyQ = lock_free_container::LockFreeRingQueue<MyVariant, 65536>;
 
 thread_pool::VariantThreadPool<MyVariant, MyQ,
-    thread_pool::BatchMode::Enabled,
+    thread_pool::BatchMode::Disabled,
     thread_pool::AffinityMode::Enabled> pool(8);
 ```
 
