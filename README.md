@@ -159,7 +159,7 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 
 ### 4. StrictVariantThreadPool
 
-自实现 `StaticPromise` / `StaticFuture` / `StaticPackagedTask`，不依赖 `std::packaged_task` / `std::future`。`std::visit` 编译期分发，不包含 `std::function<void()>` 保底类型——返回类型必须精确匹配 variant 中的 `StaticPackagedTask<T()>`，否则编译失败。兼容 `-fno-rtti -fno-exceptions`。
+自实现 `StaticPromise` / `StaticFuture` / `StaticPackagedTask` / `StaticFunction`，不依赖 `std::packaged_task` / `std::future` / `std::function`。`std::visit` 编译期分发，不包含保底类型——返回类型必须精确匹配 variant 中的 `StaticPackagedTask<T()>`，否则编译失败。兼容 `-fno-rtti -fno-exceptions`。轻量任务场景（2-8 线程）性能可达 variant 的 **2.1×**。
 
 ```cpp
 using StrictVariant = std::variant<
@@ -187,8 +187,9 @@ std::cout << fut.get();  // 42
 | `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
-> 与 VariantThreadPool 的核心区别：自实现 task/future 替代 `std::packaged_task`/`std::future`；
-> 不保留 `std::function<void()>` 保底；无 RTTI、无异常依赖。
+> 与 VariantThreadPool 的核心区别：自实现 task/future/function 替代 `std::packaged_task`/
+> `std::future`/`std::function`；不保留保底类型；零虚表、零 RTTI、零异常依赖；
+> 轻量任务低线程数性能更优。
 
 ## 替换队列与分配器
 
@@ -313,27 +314,24 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 | 场景 | 有锁线程池 | function+环形 | move_only+环形 | variant+环形 | strict+环形 | 最佳加速比 |
 |------|-----------|--------------|----------------|-------------|------------|-----------|
-| 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | 322 ms | **94×** |
-| 重量任务 (1000) | 13 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | ~5.7 ms | **2.4×** |
+| 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | **16 ms** | **211×** |
+| 重量任务 (1000) | 13 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | **2.4×** |
 | IO 混合 (10000) | 93 ms | 92 ms | 92 ms | 92 ms | 91 ms | 1.01× |
 
 > 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
 > 链表队列版本在轻量任务中耗时约为环形队列的 1.6–2×（每次入队需堆分配）。
-> strict 在轻量任务中比 variant 慢（StaticPackagedTask 内部使用 `std::function` +
-> tuple 按值捕获，比高度优化的 `std::packaged_task` 多一层调用），在重量/IO 任务中
-> 与 variant 持平。适用场景：需避免 `std::packaged_task`/`std::future` 依赖，
-> 或需兼容 `-fno-rtti -fno-exceptions` 的构建环境。
+> strict 在 2 线程时可达 variant 的 **2.1×** 速度——StaticFunction 的类型擦除
+> 比 `std::packaged_task` 更轻量（无 shared-state 开销），且 SBO 避免堆分配。
 
-### 各线程数扩展性（variant + 环形队列）
+### 各线程数扩展性（variant vs strict，环形队列，轻量任务 ms）
 
-| 场景 | 2线程 | 4线程 | 6线程 | 8线程 | 12线程 | 16线程 | 24线程 | 32线程 |
+| 实现 | 2线程 | 4线程 | 6线程 | 8线程 | 12线程 | 16线程 | 24线程 | 32线程 |
 |------|------|------|------|------|-------|-------|-------|-------|
-| 轻量任务 (ms) | 36 | **19** | 20 | 28 | 38 | 40 | **50** | 74 |
-| 重量任务 (ms) | 33 | 16 | 11 | 8.1 | 5.5 | 4.8 | **4.5** | 5.0 |
-| IO混合 (ms) | 547 | 274 | 183 | 137 | 92 | 69 | 46 | **35** |
+| variant+环形 | 35 | 25 | 29 | 44 | 53 | 39 | 56 | 86 |
+| **strict+环形** | **16** | **22** | **23** | **30** | 55 | 51 | 68 | 82 |
 
-> 轻量任务最佳在 4–6 线程（主线程单生产者瓶颈），重量任务 24 线程最优，
-> IO 混合遵循 1/N 线性扩展。
+> strict 在 2–8 线程（轻度竞争）时快 1.3–2.1×；12+ 线程后两者收敛，
+> 瓶颈从任务构造转移到队列 CAS 竞争。重量/IO 任务各实现持平。
 
 ### 性能要点
 

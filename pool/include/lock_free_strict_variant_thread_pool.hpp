@@ -1,12 +1,13 @@
 #pragma once
 // ============================================================
 // lock_free_strict_variant_thread_pool.hpp
-// 严格 variant 线程池——自实现 packaged_task/future，
+// 严格 variant 线程池——自实现 packaged_task/future/function，
 // 编译期 std::visit 分发，零虚表，零异常，零 RTTI。
 //
 // 与 VariantThreadPool 的区别：
-//   - 不使用 std::packaged_task / std::future
+//   - 不使用 std::packaged_task / std::future / std::function
 //   - 自实现 StaticPromise / StaticFuture / StaticPackagedTask
+//   - 自实现 StaticFunction（零虚表类型擦除，heap+SBO）
 //   - 不包含 std::function<void()> 保底类型
 //   - submit() 返回类型必须精确匹配 variant 中的 Task 类型，
 //     否则编译失败
@@ -17,7 +18,6 @@
 #include "lock_free_thread_pool_base.hpp"
 
 #include <atomic>
-#include <functional>
 #include <memory>
 #include <tuple>
 #include <type_traits>
@@ -71,10 +71,8 @@ public:
         return ready_.load(std::memory_order_acquire);
     }
 
-    // 返回内部存储指针（供 StaticPackagedTask 直接写入）
     void* result_ptr() noexcept { return storage_; }
 
-    // 标记结果已就绪（写入存储后调用）
     void mark_ready() noexcept
     {
         ready_.store(true, std::memory_order_release);
@@ -90,7 +88,6 @@ private:
     std::atomic<bool> ready_{false};
 };
 
-// void 特化：仅同步，不存储值
 template <>
 class StaticPromise<void>
 {
@@ -140,19 +137,16 @@ public:
     {
     }
 
-    /// @brief 阻塞等待并获取结果（仅可调用一次）
     R get()
     {
         return promise_->get_value();
     }
 
-    /// @brief 非阻塞检查是否就绪
     bool is_ready() const noexcept
     {
         return promise_->is_ready();
     }
 
-    /// @brief 阻塞等待结果就绪
     void wait() const noexcept
     {
         promise_->wait();
@@ -201,11 +195,170 @@ private:
 };
 
 // ============================================================
-// StaticPackagedTask<R> — 自实现任务包装
+// StaticFunction<R> — 零虚表类型擦除的可调用包装
 // ============================================================
-// 使用 std::function<R()> 做内部类型擦除（与 std::packaged_task
-// 内部机制一致），配合自实现的 StaticPromise/StaticFuture。
-// variant dispatch 仍为编译期 std::visit，零额外虚表。
+// 使用函数指针 + void* 实现类型擦除，无虚函数、无 RTTI。
+// 小对象优化（SBO）：≤48 字节的可调用对象存储在内部缓冲
+// 区，避免堆分配。
+// ============================================================
+namespace detail
+{
+
+template <typename R>
+struct InvokeRet
+{
+    template <typename F>
+    static R call(void* data)
+    {
+        return (*static_cast<F*>(data))();
+    }
+};
+
+template <>
+struct InvokeRet<void>
+{
+    template <typename F>
+    static void call(void* data)
+    {
+        (*static_cast<F*>(data))();
+    }
+};
+
+}  // namespace detail
+
+template <typename R>
+class StaticFunction
+{
+    using InvokeFn = R (*)(void*);
+    using DestroyFn = void (*)(void*);
+    using MoveFn = void (*)(void* src, void* dst);
+
+    static constexpr std::size_t kBufSize = 48;
+
+    InvokeFn invoke_ = nullptr;
+    DestroyFn destroy_ = nullptr;
+    MoveFn move_ = nullptr;
+    void* data_ = nullptr;
+
+    alignas(std::max_align_t) unsigned char buf_[kBufSize]{};
+    bool sbo_ = false;
+
+public:
+    StaticFunction() = default;
+
+    template <typename F>
+        requires(!std::is_same_v<std::decay_t<F>, StaticFunction>)
+    explicit StaticFunction(F&& f)
+    {
+        using DecayF = std::decay_t<F>;
+
+        if constexpr (sizeof(DecayF) <= kBufSize
+                      && alignof(DecayF) <= alignof(std::max_align_t)
+                      && std::is_nothrow_move_constructible_v<DecayF>)
+        {
+            // 小对象优化
+            ::new (buf_) DecayF(std::forward<F>(f));
+            data_ = buf_;
+            sbo_ = true;
+
+            invoke_ = &detail::InvokeRet<R>::template call<DecayF>;
+            destroy_ = +[](void* d)
+            { static_cast<DecayF*>(d)->~DecayF(); };
+            move_ = +[](void* src, void* dst)
+            {
+                auto* s = static_cast<DecayF*>(src);
+                ::new (dst) DecayF(std::move(*s));
+                s->~DecayF();
+            };
+        }
+        else
+        {
+            // 堆分配
+            data_ = new DecayF(std::forward<F>(f));
+            sbo_ = false;
+
+            invoke_ = &detail::InvokeRet<R>::template call<DecayF>;
+            destroy_ = +[](void* d)
+            { delete static_cast<DecayF*>(d); };
+            move_ = nullptr;  // 堆分配不需要 move
+        }
+    }
+
+    ~StaticFunction()
+    {
+        if (data_ && destroy_) destroy_(data_);
+    }
+
+    StaticFunction(StaticFunction&& other) noexcept
+        : invoke_(other.invoke_)
+        , destroy_(other.destroy_)
+        , move_(other.move_)
+        , sbo_(other.sbo_)
+    {
+        if (other.sbo_ && other.data_ && move_)
+        {
+            // SBO：将 callable 移动到新对象缓冲区
+            move_(other.data_, buf_);
+            data_ = buf_;
+        }
+        else
+        {
+            data_ = other.data_;
+        }
+
+        other.invoke_ = nullptr;
+        other.destroy_ = nullptr;
+        other.move_ = nullptr;
+        other.data_ = nullptr;
+        other.sbo_ = false;
+    }
+
+    StaticFunction& operator=(StaticFunction&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (data_ && destroy_) destroy_(data_);
+
+            invoke_ = other.invoke_;
+            destroy_ = other.destroy_;
+            move_ = other.move_;
+            sbo_ = other.sbo_;
+
+            if (other.sbo_ && other.data_ && move_)
+            {
+                move_(other.data_, buf_);
+                data_ = buf_;
+            }
+            else
+            {
+                data_ = other.data_;
+            }
+
+            other.invoke_ = nullptr;
+            other.destroy_ = nullptr;
+            other.move_ = nullptr;
+            other.data_ = nullptr;
+            other.sbo_ = false;
+        }
+        return *this;
+    }
+
+    StaticFunction(const StaticFunction&) = delete;
+    StaticFunction& operator=(const StaticFunction&) = delete;
+
+    explicit operator bool() const noexcept
+    {
+        return invoke_ != nullptr;
+    }
+
+    R operator()()
+    {
+        return invoke_(data_);
+    }
+};
+
+// ============================================================
+// StaticPackagedTask<R> — 自实现任务包装（零 std::function）
 // ============================================================
 template <typename R>
 class StaticPackagedTask
@@ -221,24 +374,22 @@ public:
         using Bound = std::tuple<std::decay_t<F>,
                                  std::decay_t<Args>...>;
 
-        // 可拷贝 → 按值捕获到 lambda（零额外堆分配）
-        // 不可拷贝（如 unique_ptr）→ shared_ptr 包装
+        // 可拷贝 → 按值捕获（零额外堆分配）
+        // 不可拷贝 → shared_ptr 包装
         if constexpr (std::is_copy_constructible_v<Bound>)
         {
-            func_ = [bound = Bound(std::forward<F>(f),
-                                   std::forward<Args>(args)...)]() mutable -> R
-            {
-                return invoke_bound(std::move(bound));
-            };
+            func_ = StaticFunction<R>(
+                [bound = Bound(std::forward<F>(f),
+                               std::forward<Args>(args)...)]() mutable -> R
+                { return invoke_bound(std::move(bound)); });
         }
         else
         {
             auto bound = std::make_shared<Bound>(
                 std::forward<F>(f), std::forward<Args>(args)...);
-            func_ = [bound]() -> R
-            {
-                return invoke_bound(std::move(*bound));
-            };
+            func_ = StaticFunction<R>(
+                [bound]() -> R
+                { return invoke_bound(std::move(*bound)); });
         }
     }
 
@@ -273,38 +424,22 @@ public:
     ~StaticPackagedTask() = default;
 
 private:
-    // 从 Bound tuple 中调用 callable
     template <typename Bound>
     static R invoke_bound(Bound&& bound)
     {
-        if constexpr (std::is_void_v<R>)
-        {
-            std::apply(
-                [](auto&& fn, auto&&... a)
-                { std::invoke(std::forward<decltype(fn)>(fn),
-                              std::forward<decltype(a)>(a)...); },
-                std::forward<Bound>(bound));
-        }
-        else
-        {
-            return std::apply(
-                [](auto&& fn, auto&&... a)
-                { return std::invoke(
-                      std::forward<decltype(fn)>(fn),
-                      std::forward<decltype(a)>(a)...); },
-                std::forward<Bound>(bound));
-        }
+        return std::apply(
+            [](auto&& fn, auto&&... a) -> decltype(auto)
+            { return static_cast<decltype(fn)>(fn)(
+                  static_cast<decltype(a)>(a)...); },
+            std::forward<Bound>(bound));
     }
 
-    std::function<R()> func_;
+    StaticFunction<R> func_;
     std::shared_ptr<StaticPromise<R>> promise_;
 };
 
 // ============================================================
 // StrictVariantThreadPool
-// ============================================================
-// submit() 返回类型必须匹配 VariantType 中的 StaticPackagedTask<T()>，
-// 否则 static_assert 编译失败。不包含保底类型。
 // ============================================================
 template <typename VariantType,
           typename QueueType =
@@ -337,9 +472,6 @@ public:
         this->ensure_batch_flushed();
     }
 
-    // ---- 提交任务 ----
-    // 返回类型必须匹配 VariantType 中的 StaticPackagedTask<T()>。
-    // 无保底措施——不匹配的返回类型直接编译失败。
     template <typename Func, typename... Args>
     auto submit(Func&& func, Args&&... args)
     {
@@ -348,7 +480,6 @@ public:
         using TaskForReturn =
             StaticPackagedTask<ReturnType>;
 
-        // 编译期检查：返回类型必须在 variant 中有对应的 task 类型
         static_assert(
             is_in_variant_v<TaskForReturn, VariantType>,
             "Return type not covered by variant. "
