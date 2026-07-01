@@ -66,7 +66,8 @@ int v; queue.dequeue(v);    // 空时返回 false
 | `Allocator` | `DefaultAllocator<T>` | 分配器，暴露为 `allocator_type` |
 
 > `T` 无需默认可构造。  
-> 分配器副本通过 `get_allocator()` 获取。
+> 分配器副本通过 `get_allocator()` 获取。  
+> 支持批量操作：`enqueue_batch(T*, size_t)` / `dequeue_batch(T*, size_t)` 原子地预留连续槽位，返回实际成功数量（≤ 请求数），不会丢失任务。
 
 ## 线程池变体
 
@@ -90,19 +91,25 @@ thread_pool::LockFreeThreadPool<> pool2(2);
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型，分配器从 `QueueType::allocator_type` 推导 |
+| `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
-分配器类型从队列类型推导（同 `std::priority_queue` 设计）。
-若需自定义分配器，将其嵌入队列类型：
+分配器类型从 `QueueType::allocator_type` 推导（同 `std::priority_queue` 设计）：
 
 ```cpp
-// 方式一：通过向后兼容别名
+// 通过向后兼容别名指定分配器
 thread_pool::LockFreeThreadPool<MyAllocator> pool(4);
 
-// 方式二：直接指定队列类型
+// 直接指定队列 + 分配器
 using MyQueue = lock_free_container::LockFreeQueue<
     std::function<void()>, MyAllocator>;
 thread_pool::DynamicThreadPool<MyQueue> pool(4, my_allocator);
+
+// 启用批量入队 + CPU 亲和性
+thread_pool::DynamicThreadPool<MyQueue,
+    thread_pool::BatchMode::Enabled,
+    thread_pool::AffinityMode::Enabled> pool(4, my_allocator);
 ```
 
 ### 2. DynamicMoveOnlyThreadPool（C++23）
@@ -123,7 +130,9 @@ thread_pool::LockFreeMoveOnlyThreadPool<> pool2(2);
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型，分配器从 `QueueType::allocator_type` 推导 |
+| `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ### 3. VariantThreadPool
 
@@ -146,7 +155,9 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `VariantType` | 无 | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
-| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型，分配器从 `QueueType::allocator_type` 推导 |
+| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ## 替换队列与分配器
 
@@ -241,7 +252,7 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 | 场景 | 有锁线程池 | function+环形 | move_only+环形 | variant+环形 | 最佳加速比 |
 |------|-----------|--------------|----------------|-------------|-----------|
 | 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | **94×** |
-| 重量任务 (1000) | 13 ms | 5.4 ms | 5.5 ms | 5.6 ms | **2.5×** |
+| 重量任务 (1000) | 13 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | **2.4×** |
 | IO 混合 (10000) | 93 ms | 92 ms | 92 ms | 92 ms | 1.01× |
 
 > 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
@@ -252,7 +263,7 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 | 场景 | 2线程 | 4线程 | 6线程 | 8线程 | 12线程 | 16线程 | 24线程 | 32线程 |
 |------|------|------|------|------|-------|-------|-------|-------|
 | 轻量任务 (ms) | 36 | **19** | 20 | 28 | 38 | 40 | **50** | 74 |
-| 重量任务 (ms) | 33 | 16 | 11 | 8.1 | 5.4 | 5.0 | **4.3** | 5.0 |
+| 重量任务 (ms) | 33 | 16 | 11 | 8.1 | 5.5 | 4.8 | **4.5** | 5.0 |
 | IO混合 (ms) | 547 | 274 | 183 | 137 | 92 | 69 | 46 | **35** |
 
 > 轻量任务最佳在 4–6 线程（主线程单生产者瓶颈），重量任务 24 线程最优，
@@ -288,11 +299,6 @@ thread_pool::VariantThreadPool<MyVariant, MyQ,
 ```
 
 底层自动生效的优化：PAUSE→yield→sleep 三级 CAS 退避、每线程独立统计槽位消除 `completed_count()` 缓存弹跳、`submit()` 多生产者安全。
-
-- **轻量任务**：variant + 环形队列组合因编译期分发消除类型擦除、且环形队列无内存分配，性能最优（4线程时 94× 于有锁池）。但受主线程单生产者瓶颈限制，最佳线程数 4–6，超过后 CAS 竞争增加导致退化。环形队列比链表队列快 1.6–2×（省去每次 `new`/`delete`）。
-- **重量任务**：任务执行时间（fib(25) 约 70μs）远大于调度开销，无锁池在 16–24 线程达最佳，有锁池因互斥锁争用在 8 线程后退化。
-- **IO 混合**：12 线程以下瓶颈在 sleep，各池无差异；16 线程起无锁池领先（sleep(1ms) 占比 10% 的任务消化更快），32 线程加速比 ~3.9×。
-- **false sharing**：基类原子计数器（`active_tasks_` 等）经 `alignas(64)` 缓存行隔离后，低线程时性能随线程数线性扩展，消除了"线程越多越慢"的反常现象。
 
 ## 编译器要求
 
