@@ -98,14 +98,8 @@ private:
     }
 };
 
-// 向后兼容别名
-template <
-    typename Alloc =
-        std::allocator<std::move_only_function<void()>>>
-using LockFreeMoveOnlyThreadPool =
-    DynamicMoveOnlyThreadPool<
-        lock_free_container::LockFreeQueue<
-            std::move_only_function<void()>, Alloc>>;
+// 向后兼容别名（默认队列 + 默认选项）
+using LockFreeMoveOnlyThreadPool = DynamicMoveOnlyThreadPool<>;
 
 }  // namespace thread_pool
 

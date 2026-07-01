@@ -79,31 +79,58 @@ public:
     static constexpr int kPauseThreshold = 32;
     static constexpr int kYieldThreshold = 256;
 
-    // ---- 构造 ----
+    // ---- 构造：通过分配器 ----
+    // @param num_threads 工作线程数（默认硬件并发数）
+    // @param alloc       分配器，透传给底层队列
+    // @param core_ids    CPU 亲和性核心列表（仅 AffinityMode::Enabled 时生效）
     explicit LockFreeThreadPoolBase(
         std::size_t num_threads =
             std::thread::hardware_concurrency(),
-        const allocator_type& alloc = allocator_type())
+        const allocator_type& alloc = allocator_type(),
+        std::vector<unsigned int> core_ids = {})
         : task_queue_(alloc), task_allocator_(alloc),
-          worker_stats_(num_threads + 1), stop_{false},
+          worker_stats_(num_threads + 1),
+          affinity_cores_(std::move(core_ids)),
+          stop_{false},
           active_tasks_{0}, total_tasks_{0}, completed_tasks_{0}
     {
-        // 每线程统计槽位在初始化列表中已构造 (num_threads + 1 个)
-        // 槽位 0 保留给主生产者
+        init_workers(num_threads);
+    }
 
-        workers_.reserve(num_threads);
-        for (std::size_t i = 0; i < num_threads; ++i)
-        {
-            workers_.emplace_back(
-                [this, worker_id = i + 1]
-                { this->worker_thread(worker_id); });
-        }
+    // ---- 构造：通过队列（拷贝） ----
+    // @param num_threads 工作线程数（必填，无默认值以防歧义）
+    // @param queue       队列副本
+    // @param core_ids    CPU 亲和性核心列表
+    explicit LockFreeThreadPoolBase(
+        std::size_t num_threads,
+        const QueueType& queue,
+        std::vector<unsigned int> core_ids = {})
+        : task_queue_(queue),
+          task_allocator_(queue.get_allocator()),
+          worker_stats_(num_threads + 1),
+          affinity_cores_(std::move(core_ids)),
+          stop_{false},
+          active_tasks_{0}, total_tasks_{0}, completed_tasks_{0}
+    {
+        init_workers(num_threads);
+    }
 
-        // CPU 亲和性绑定
-        if constexpr (AffinityV == AffinityMode::Enabled)
-        {
-            apply_affinity();
-        }
+    // ---- 构造：通过队列（移动） ----
+    // @param num_threads 工作线程数（必填）
+    // @param queue       队列（移动语义）
+    // @param core_ids    CPU 亲和性核心列表
+    explicit LockFreeThreadPoolBase(
+        std::size_t num_threads,
+        QueueType&& queue,
+        std::vector<unsigned int> core_ids = {})
+        : task_queue_(std::move(queue)),
+          task_allocator_(task_queue_.get_allocator()),
+          worker_stats_(num_threads + 1),
+          affinity_cores_(std::move(core_ids)),
+          stop_{false},
+          active_tasks_{0}, total_tasks_{0}, completed_tasks_{0}
+    {
+        init_workers(num_threads);
     }
 
     // ---- 禁止拷贝/移动 ----
@@ -295,6 +322,9 @@ protected:
     // 每线程统计槽位（槽位 0 保留，1..N 对应工作线程）
     std::vector<ThreadStatSlot> worker_stats_;
 
+    // CPU 亲和性核心列表（空 = 自动分配 0,1,2,...）
+    std::vector<unsigned int> affinity_cores_;
+
     // 全局原子计数器（生产者侧使用，保持简单）
     alignas(lock_free_util::kCacheLineSize)
         std::atomic<bool> stop_;
@@ -306,26 +336,53 @@ protected:
         std::atomic<std::size_t> completed_tasks_;
 
 private:
+    // ---- 工作线程初始化（所有构造函数共用） ----
+    void init_workers(std::size_t num_threads)
+    {
+        workers_.reserve(num_threads);
+        for (std::size_t i = 0; i < num_threads; ++i)
+        {
+            workers_.emplace_back(
+                [this, worker_id = i + 1]
+                { this->worker_thread(worker_id); });
+        }
+
+        if constexpr (AffinityV == AffinityMode::Enabled)
+        {
+            apply_affinity();
+        }
+    }
+
     // ---- CPU 亲和性绑定 ----
+    // 若用户指定了核心列表则使用之，否则自动分配 0,1,2,...
     void apply_affinity() noexcept
     {
 #if defined(__linux__)
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
+        if (workers_.empty()) return;
 
-        unsigned int num_cores =
-            std::thread::hardware_concurrency();
-        for (unsigned int i = 0; i < num_cores && i < workers_.size(); ++i)
+        // 确定要绑定的核心列表
+        std::vector<unsigned int> cores;
+        if (!affinity_cores_.empty())
         {
-            CPU_SET(static_cast<int>(i), &cpuset);
+            cores = affinity_cores_;
+        }
+        else
+        {
+            unsigned int num_cores =
+                std::thread::hardware_concurrency();
+            for (unsigned int i = 0;
+                 i < num_cores && i < workers_.size(); ++i)
+            {
+                cores.push_back(i);
+            }
         }
 
         for (std::size_t i = 0; i < workers_.size(); ++i)
         {
-            // 每个工作线程绑定到不同核心（i % num_cores）
             cpu_set_t thread_set;
             CPU_ZERO(&thread_set);
-            CPU_SET(static_cast<int>(i % num_cores), &thread_set);
+            unsigned int core = cores[i % cores.size()];
+            CPU_SET(static_cast<int>(core), &thread_set);
 
             pthread_t native_handle =
                 workers_[i].native_handle();

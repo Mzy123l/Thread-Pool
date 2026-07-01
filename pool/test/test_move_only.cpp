@@ -94,7 +94,7 @@ void test_queue_concurrent()
 
 void test_thread_pool_return_values()
 {
-    LockFreeMoveOnlyThreadPool<> pool(4);
+    LockFreeMoveOnlyThreadPool pool(4);
 
     auto sum = pool.submit([](int a, int b) {
         return a + b;
@@ -117,7 +117,7 @@ void test_thread_pool_return_values()
 
 void test_thread_pool_batch_tasks()
 {
-    LockFreeMoveOnlyThreadPool<> pool(4);
+    LockFreeMoveOnlyThreadPool pool(4);
     std::atomic<int> counter{0};
     std::vector<std::future<int>> futures;
 
@@ -148,7 +148,7 @@ void test_thread_pool_batch_tasks()
 
 void test_thread_pool_exception_task()
 {
-    LockFreeMoveOnlyThreadPool<> pool(2);
+    LockFreeMoveOnlyThreadPool pool(2);
 
     auto failed = pool.submit([]() -> int {
         throw std::runtime_error("expected test exception");

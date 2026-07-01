@@ -83,8 +83,8 @@ thread_pool::DynamicThreadPool<> pool(4);
 auto f1 = pool.submit([]{ return 42; });
 auto f2 = pool.submit([](int x){ return x * x; }, 5);
 
-// 向后兼容别名
-thread_pool::LockFreeThreadPool<> pool2(2);
+// 向后兼容别名（无模板参数，仅使用默认队列）
+thread_pool::LockFreeThreadPool pool2(2);
 ```
 
 #### 模板参数
@@ -98,9 +98,6 @@ thread_pool::LockFreeThreadPool<> pool2(2);
 分配器类型从 `QueueType::allocator_type` 推导（同 `std::priority_queue` 设计）：
 
 ```cpp
-// 通过向后兼容别名指定分配器
-thread_pool::LockFreeThreadPool<MyAllocator> pool(4);
-
 // 直接指定队列 + 分配器
 using MyQueue = lock_free_container::LockFreeQueue<
     std::function<void()>, MyAllocator>;
@@ -122,8 +119,8 @@ thread_pool::DynamicMoveOnlyThreadPool<> pool(4);
 auto ptr = std::make_unique<int>(42);
 auto fut = pool.submit([p = std::move(ptr)] { return *p; });
 
-// 向后兼容别名
-thread_pool::LockFreeMoveOnlyThreadPool<> pool2(2);
+// 向后兼容别名（无模板参数，仅使用默认队列）
+thread_pool::LockFreeMoveOnlyThreadPool pool2(2);
 ```
 
 #### 模板参数
@@ -205,18 +202,49 @@ thread_pool::DynamicThreadPool<MyQueue> pool(4, alloc);
 
 ### 构造参数
 
+支持三种构造方式，所有线程池变体通用：
+
 ```cpp
-// num_threads: 工作线程数（默认硬件并发数）
-// alloc:       分配器实例，透传给底层队列（默认构造）
+// 1. 通过分配器构造（最常用）
 DynamicThreadPool(
     std::size_t num_threads = std::thread::hardware_concurrency(),
-    const allocator_type& alloc = allocator_type()
+    const allocator_type& alloc = allocator_type(),
+    std::vector<unsigned int> core_ids = {}  // 仅 AffinityMode::Enabled 时生效
+);
+
+// 2. 通过队列拷贝构造（使用预配置的队列）
+DynamicThreadPool(
+    std::size_t num_threads,
+    const QueueType& queue,
+    std::vector<unsigned int> core_ids = {}
+);
+
+// 3. 通过队列移动构造（转移队列所有权）
+DynamicThreadPool(
+    std::size_t num_threads,
+    QueueType&& queue,
+    std::vector<unsigned int> core_ids = {}
 );
 ```
 
-分配器同时用于：
-- 底层队列的节点和数据内存分配
-- `submit()` 中 `packaged_task` 的内存分配（经 `allocator_traits::rebind`）
+| 参数 | 说明 |
+|------|------|
+| `num_threads` | 工作线程数（默认 `hardware_concurrency()`） |
+| `alloc` | 分配器，同 `std::priority_queue` 约定，同时用于队列节点和 `packaged_task` |
+| `queue` | 预配置的队列实例（如指定容量的环形队列或自定义分配器） |
+| `core_ids` | CPU 亲和性核心列表（空 = 自动分配 0,1,2,…；仅 `AffinityMode::Enabled` 时生效） |
+
+```cpp
+// 示例：环形队列 + 移动构造 + 手动指定亲和核心
+using RingQ = lock_free_container::LockFreeRingQueue<
+    std::function<void()>, 4096>;
+
+RingQ queue;  // 预配置队列
+thread_pool::DynamicThreadPool<RingQ,
+    thread_pool::BatchMode::Disabled,
+    thread_pool::AffinityMode::Enabled> pool(
+    4, std::move(queue), {0, 2, 4, 6});  // 绑定到核心 0,2,4,6
+```
 
 ## 构建与测试
 
