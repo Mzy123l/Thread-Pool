@@ -54,7 +54,7 @@ public:
 
     ~DynamicMoveOnlyThreadPool()
     {
-        // batch flush removed
+        this->ensure_batch_flushed();
     }
 
     template <typename Func, typename... Args>
@@ -82,7 +82,7 @@ public:
 
         if constexpr (BatchV == BatchMode::Enabled)
         {
-            this->enqueue_task(std::move(wrapper));
+            this->enqueue_task_batch(std::move(wrapper));
         }
         else
         {

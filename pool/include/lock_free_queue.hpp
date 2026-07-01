@@ -319,13 +319,6 @@ class LockFreeQueue
             }
         }
 
-        // 链表队列不支持批量出队（无连续槽位），返回 0
-        // 调用方应回退到逐个 dequeue
-        size_t dequeue_batch(T* /*items*/, size_t /*count*/)
-        {
-            return 0;
-        }
-
         void clear()
         {
             T dummy;
