@@ -6,7 +6,7 @@
 //
 // 与 VariantThreadPool 的区别：
 //   - 不使用 std::packaged_task / std::future
-//   - 自实现 SimplePromise / SimpleFuture / SimplePackagedTask
+//   - 自实现 StaticPromise / StaticFuture / StaticPackagedTask
 //   - 不包含 std::function<void()> 保底类型
 //   - submit() 返回类型必须精确匹配 variant 中的 Task 类型，
 //     否则编译失败
@@ -28,13 +28,13 @@ namespace thread_pool
 {
 
 // ============================================================
-// SimplePromise<R> — 单次赋值的结果容器
+// StaticPromise<R> — 单次赋值的结果容器
 // ============================================================
 template <typename R>
-class SimplePromise
+class StaticPromise
 {
 public:
-    SimplePromise() = default;
+    StaticPromise() = default;
 
     void set_value(const R& value)
     {
@@ -71,7 +71,7 @@ public:
         return ready_.load(std::memory_order_acquire);
     }
 
-    // 返回内部存储指针（供 SimplePackagedTask 直接写入）
+    // 返回内部存储指针（供 StaticPackagedTask 直接写入）
     void* result_ptr() noexcept { return storage_; }
 
     // 标记结果已就绪（写入存储后调用）
@@ -80,10 +80,10 @@ public:
         ready_.store(true, std::memory_order_release);
     }
 
-    SimplePromise(const SimplePromise&) = delete;
-    SimplePromise& operator=(const SimplePromise&) = delete;
-    SimplePromise(SimplePromise&&) = delete;
-    SimplePromise& operator=(SimplePromise&&) = delete;
+    StaticPromise(const StaticPromise&) = delete;
+    StaticPromise& operator=(const StaticPromise&) = delete;
+    StaticPromise(StaticPromise&&) = delete;
+    StaticPromise& operator=(StaticPromise&&) = delete;
 
 private:
     alignas(R) unsigned char storage_[sizeof(R)];
@@ -92,10 +92,10 @@ private:
 
 // void 特化：仅同步，不存储值
 template <>
-class SimplePromise<void>
+class StaticPromise<void>
 {
 public:
-    SimplePromise() = default;
+    StaticPromise() = default;
 
     void set_value()
     {
@@ -127,15 +127,15 @@ private:
 };
 
 // ============================================================
-// SimpleFuture<R> — 用户持有的结果句柄
+// StaticFuture<R> — 用户持有的结果句柄
 // ============================================================
 template <typename R>
-class SimpleFuture
+class StaticFuture
 {
 public:
-    using PromisePtr = std::shared_ptr<SimplePromise<R>>;
+    using PromisePtr = std::shared_ptr<StaticPromise<R>>;
 
-    explicit SimpleFuture(PromisePtr p) noexcept
+    explicit StaticFuture(PromisePtr p) noexcept
         : promise_(std::move(p))
     {
     }
@@ -158,21 +158,21 @@ public:
         promise_->wait();
     }
 
-    SimpleFuture() = default;
-    SimpleFuture(SimpleFuture&&) noexcept = default;
-    SimpleFuture& operator=(SimpleFuture&&) noexcept = default;
+    StaticFuture() = default;
+    StaticFuture(StaticFuture&&) noexcept = default;
+    StaticFuture& operator=(StaticFuture&&) noexcept = default;
 
 private:
     PromisePtr promise_;
 };
 
 template <>
-class SimpleFuture<void>
+class StaticFuture<void>
 {
 public:
-    using PromisePtr = std::shared_ptr<SimplePromise<void>>;
+    using PromisePtr = std::shared_ptr<StaticPromise<void>>;
 
-    explicit SimpleFuture(PromisePtr p) noexcept
+    explicit StaticFuture(PromisePtr p) noexcept
         : promise_(std::move(p))
     {
     }
@@ -192,31 +192,31 @@ public:
         promise_->wait();
     }
 
-    SimpleFuture() = default;
-    SimpleFuture(SimpleFuture&&) noexcept = default;
-    SimpleFuture& operator=(SimpleFuture&&) noexcept = default;
+    StaticFuture() = default;
+    StaticFuture(StaticFuture&&) noexcept = default;
+    StaticFuture& operator=(StaticFuture&&) noexcept = default;
 
 private:
     PromisePtr promise_;
 };
 
 // ============================================================
-// SimplePackagedTask<R> — 自实现任务包装
+// StaticPackagedTask<R> — 自实现任务包装
 // ============================================================
 // 使用 std::function<R()> 做内部类型擦除（与 std::packaged_task
-// 内部机制一致），配合自实现的 SimplePromise/SimpleFuture。
+// 内部机制一致），配合自实现的 StaticPromise/StaticFuture。
 // variant dispatch 仍为编译期 std::visit，零额外虚表。
 // ============================================================
 template <typename R>
-class SimplePackagedTask
+class StaticPackagedTask
 {
 public:
-    SimplePackagedTask() = default;
+    StaticPackagedTask() = default;
 
     template <typename F, typename... Args>
         requires std::is_invocable_r_v<R, F, Args...>
-    explicit SimplePackagedTask(F&& f, Args&&... args)
-        : promise_(std::make_shared<SimplePromise<R>>())
+    explicit StaticPackagedTask(F&& f, Args&&... args)
+        : promise_(std::make_shared<StaticPromise<R>>())
     {
         // 将 callable + 参数打包为 tuple，lambda 内 apply 调用
         using Bound = std::tuple<std::decay_t<F>,
@@ -262,29 +262,29 @@ public:
         }
     }
 
-    SimpleFuture<R> get_future()
+    StaticFuture<R> get_future()
     {
-        return SimpleFuture<R>(promise_);
+        return StaticFuture<R>(promise_);
     }
 
-    SimplePackagedTask(SimplePackagedTask&&) noexcept = default;
-    SimplePackagedTask& operator=(
-        SimplePackagedTask&&) noexcept = default;
-    SimplePackagedTask(const SimplePackagedTask&) = delete;
-    SimplePackagedTask& operator=(
-        const SimplePackagedTask&) = delete;
+    StaticPackagedTask(StaticPackagedTask&&) noexcept = default;
+    StaticPackagedTask& operator=(
+        StaticPackagedTask&&) noexcept = default;
+    StaticPackagedTask(const StaticPackagedTask&) = delete;
+    StaticPackagedTask& operator=(
+        const StaticPackagedTask&) = delete;
 
-    ~SimplePackagedTask() = default;
+    ~StaticPackagedTask() = default;
 
 private:
     std::function<R()> func_;
-    std::shared_ptr<SimplePromise<R>> promise_;
+    std::shared_ptr<StaticPromise<R>> promise_;
 };
 
 // ============================================================
 // StrictVariantThreadPool
 // ============================================================
-// submit() 返回类型必须匹配 VariantType 中的 SimplePackagedTask<T()>，
+// submit() 返回类型必须匹配 VariantType 中的 StaticPackagedTask<T()>，
 // 否则 static_assert 编译失败。不包含保底类型。
 // ============================================================
 template <typename VariantType,
@@ -319,7 +319,7 @@ public:
     }
 
     // ---- 提交任务 ----
-    // 返回类型必须匹配 VariantType 中的 SimplePackagedTask<T()>。
+    // 返回类型必须匹配 VariantType 中的 StaticPackagedTask<T()>。
     // 无保底措施——不匹配的返回类型直接编译失败。
     template <typename Func, typename... Args>
     auto submit(Func&& func, Args&&... args)
@@ -327,13 +327,13 @@ public:
         using ReturnType =
             typename std::invoke_result<Func, Args...>::type;
         using TaskForReturn =
-            SimplePackagedTask<ReturnType>;
+            StaticPackagedTask<ReturnType>;
 
         // 编译期检查：返回类型必须在 variant 中有对应的 task 类型
         static_assert(
             is_in_variant_v<TaskForReturn, VariantType>,
             "Return type not covered by variant. "
-            "Add SimplePackagedTask<ReturnType()> to the variant.");
+            "Add StaticPackagedTask<ReturnType()> to the variant.");
 
         constexpr std::size_t idx =
             variant_index_v<TaskForReturn, VariantType>;

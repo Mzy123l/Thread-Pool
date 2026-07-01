@@ -126,9 +126,9 @@ using BenchVariant = std::variant<
 
 // StrictVariant 线程池的基准测试类型（自实现 task/future）
 using StrictBenchVariant = std::variant<
-    thread_pool::SimplePackagedTask<void>,
-    thread_pool::SimplePackagedTask<int>,
-    thread_pool::SimplePackagedTask<long long>>;
+    thread_pool::StaticPackagedTask<void>,
+    thread_pool::StaticPackagedTask<int>,
+    thread_pool::StaticPackagedTask<long long>>;
 
 // 环形队列容量（须为 2 的幂）
 constexpr std::size_t RING_CAPACITY = 65536;
@@ -244,7 +244,7 @@ template<typename Pool>
 IterResult run_test_once(Pool& pool, const std::vector<std::function<void()>>& tasks)
 {
     auto start = Clock::now();
-    // 使用 auto 推导 future 类型（兼容 std::future 和 SimpleFuture）
+    // 使用 auto 推导 future 类型（兼容 std::future 和 StaticFuture）
     std::vector<decltype(pool.submit(tasks.front()))> futures;
     futures.reserve(tasks.size());
     for (const auto& t : tasks)

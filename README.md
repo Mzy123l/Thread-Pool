@@ -152,25 +152,25 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `VariantType` | 无 | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
+| `VariantType` | — | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
 | `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ### 4. StrictVariantThreadPool
 
-自实现 `SimplePromise` / `SimpleFuture` / `SimplePackagedTask`，不依赖 `std::packaged_task` / `std::future`。`std::visit` 编译期分发，不包含 `std::function<void()>` 保底类型——返回类型必须精确匹配 variant 中的 `SimplePackagedTask<T()>`，否则编译失败。兼容 `-fno-rtti -fno-exceptions`。
+自实现 `StaticPromise` / `StaticFuture` / `StaticPackagedTask`，不依赖 `std::packaged_task` / `std::future`。`std::visit` 编译期分发，不包含 `std::function<void()>` 保底类型——返回类型必须精确匹配 variant 中的 `StaticPackagedTask<T()>`，否则编译失败。兼容 `-fno-rtti -fno-exceptions`。
 
 ```cpp
 using StrictVariant = std::variant<
-    thread_pool::SimplePackagedTask<void>,
-    thread_pool::SimplePackagedTask<int>,
-    thread_pool::SimplePackagedTask<std::string>
+    thread_pool::StaticPackagedTask<void>,
+    thread_pool::StaticPackagedTask<int>,
+    thread_pool::StaticPackagedTask<std::string>
 >;
 
 thread_pool::StrictVariantThreadPool<StrictVariant> pool(4);
 
-// 返回 int → 匹配 SimplePackagedTask<int()> ✓
+// 返回 int → 匹配 StaticPackagedTask<int()> ✓
 auto fut = pool.submit([] { return 42; });
 std::cout << fut.get();  // 42
 
@@ -182,7 +182,7 @@ std::cout << fut.get();  // 42
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `VariantType` | 无 | 任务 variant 类型，须包含对应返回类型的 `SimplePackagedTask<T()>` |
+| `VariantType` | — | 任务 variant 类型，须包含对应返回类型的 `StaticPackagedTask<T()>` |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
 | `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
@@ -311,14 +311,17 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 ### 基准对比（12 工作线程）
 
-| 场景 | 有锁线程池 | function+环形 | move_only+环形 | variant+环形 | 最佳加速比 |
-|------|-----------|--------------|----------------|-------------|-----------|
-| 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | **94×** |
-| 重量任务 (1000) | 13 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | **2.4×** |
-| IO 混合 (10000) | 93 ms | 92 ms | 92 ms | 92 ms | 1.01× |
+| 场景 | 有锁线程池 | function+环形 | move_only+环形 | variant+环形 | strict+环形 | 最佳加速比 |
+|------|-----------|--------------|----------------|-------------|------------|-----------|
+| 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | 456 ms | **94×** |
+| 重量任务 (1000) | 13 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | ~5.7 ms | **2.4×** |
+| IO 混合 (10000) | 93 ms | 92 ms | 92 ms | 92 ms | 91 ms | 1.01× |
 
 > 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
 > 链表队列版本在轻量任务中耗时约为环形队列的 1.6–2×（每次入队需堆分配）。
+> strict 在轻量任务中比 variant 慢（自实现 StaticPackagedTask 额外分配开销），
+> 在重量/IO 任务中与 variant 持平。适用场景：需避免 `std::packaged_task`/`std::future`
+> 依赖，或需兼容 `-fno-rtti -fno-exceptions` 的构建环境。
 
 ### 各线程数扩展性（variant + 环形队列）
 

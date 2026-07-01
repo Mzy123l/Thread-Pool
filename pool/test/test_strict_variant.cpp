@@ -8,12 +8,12 @@
 #include "../include/lock_free_ring_queue.hpp"
 
 // ---- 测试用 task variant ----
-// 仅包含需要返回类型的 SimplePackagedTask，无 std::function 保底
+// 仅包含需要返回类型的 StaticPackagedTask，无 std::function 保底
 using StrictVariant = std::variant<
-    thread_pool::SimplePackagedTask<void>,
-    thread_pool::SimplePackagedTask<int>,
-    thread_pool::SimplePackagedTask<long long>,
-    thread_pool::SimplePackagedTask<std::string>>;
+    thread_pool::StaticPackagedTask<void>,
+    thread_pool::StaticPackagedTask<int>,
+    thread_pool::StaticPackagedTask<long long>,
+    thread_pool::StaticPackagedTask<std::string>>;
 
 // ============================================================
 // 基础功能
@@ -67,7 +67,7 @@ TEST(StrictVariantPoolTest, BatchTasks)
     thread_pool::StrictVariantThreadPool<StrictVariant> pool(4);
     constexpr int N = 100;
 
-    std::vector<thread_pool::SimpleFuture<int>> futures;
+    std::vector<thread_pool::StaticFuture<int>> futures;
     futures.reserve(N);
     for (int i = 0; i < N; ++i)
     {
@@ -122,7 +122,7 @@ TEST(StrictVariantPoolTest, ConcurrentSubmit)
     constexpr int N = 500;
     std::atomic<int> counter{0};
 
-    std::vector<thread_pool::SimpleFuture<void>> futures;
+    std::vector<thread_pool::StaticFuture<void>> futures;
     futures.reserve(N);
 
     for (int i = 0; i < N; ++i)
