@@ -4,9 +4,7 @@
 // ============================================================
 // 使用 std::variant<PackagedTasks...> 消除运行时类型擦除，
 // std::visit 编译期跳转表替代虚函数分发。
-// 适用于需要零开销任务分发的场景。
-// 分配器类型从 QueueType::allocator_type 推导，
-// 参照 std::priority_queue 设计。
+// 支持批量入队（BatchMode）和 CPU 亲和性（AffinityMode）。
 //
 // 用法：
 //   using MyVariant = std::variant<
@@ -34,25 +32,39 @@ namespace thread_pool
 
 template <typename VariantType,
           typename QueueType =
-              lock_free_container::LockFreeQueue<VariantType>>
+              lock_free_container::LockFreeQueue<VariantType>,
+          BatchMode BatchV = BatchMode::Disabled,
+          AffinityMode AffinityV = AffinityMode::Disabled>
 class VariantThreadPool
     : public LockFreeThreadPoolBase<VariantType,
                                     VariantThreadPool<VariantType,
-                                                      QueueType>,
-                                    QueueType>
+                                                      QueueType,
+                                                      BatchV,
+                                                      AffinityV>,
+                                    QueueType,
+                                    BatchV,
+                                    AffinityV>
 {
     using Base =
         LockFreeThreadPoolBase<VariantType,
                                VariantThreadPool<VariantType,
-                                                 QueueType>,
-                               QueueType>;
+                                                 QueueType,
+                                                 BatchV,
+                                                 AffinityV>,
+                               QueueType,
+                               BatchV,
+                               AffinityV>;
     friend Base;
 
 public:
     using Base::Base;
 
+    ~VariantThreadPool()
+    {
+        this->ensure_batch_flushed();
+    }
+
     // ---- 提交任务 ----
-    // 编译期根据返回类型选择 variant 中对应的 packaged_task 候选项
     template <typename Func, typename... Args>
     auto submit(Func&& func, Args&&... args)
         -> std::future<
@@ -64,7 +76,6 @@ public:
 
         if constexpr (is_in_variant_v<PackagedTask, VariantType>)
         {
-            // 直接路径：零类型擦除
             constexpr std::size_t idx =
                 variant_index_v<PackagedTask, VariantType>;
 
@@ -73,15 +84,23 @@ public:
                           std::forward<Args>(args)...));
             std::future<ReturnType> result = pt.get_future();
 
-            this->enqueue_task(
+            auto variant_task =
                 VariantType(std::in_place_index<idx>,
-                            std::move(pt)));
+                            std::move(pt));
+
+            if constexpr (BatchV == BatchMode::Enabled)
+            {
+                this->enqueue_task_batch(std::move(variant_task));
+            }
+            else
+            {
+                this->enqueue_task(std::move(variant_task));
+            }
             return result;
         }
         else if constexpr (is_in_variant_v<std::function<void()>,
                                            VariantType>)
         {
-            // 回退路径：std::function<void()> 包装
             constexpr std::size_t idx =
                 variant_index_v<std::function<void()>,
                                 VariantType>;
@@ -91,16 +110,24 @@ public:
                           std::forward<Args>(args)...));
             std::future<ReturnType> result = pt->get_future();
 
-            this->enqueue_task(
+            auto variant_task =
                 VariantType(std::in_place_index<idx>,
                             std::function<void()>(
                                 [pt]()
-                                { (*pt)(); })));
+                                { (*pt)(); }));
+
+            if constexpr (BatchV == BatchMode::Enabled)
+            {
+                this->enqueue_task_batch(std::move(variant_task));
+            }
+            else
+            {
+                this->enqueue_task(std::move(variant_task));
+            }
             return result;
         }
         else
         {
-            // 编译期报错：返回类型未被 variant 覆盖
             static_assert(
                 sizeof(ReturnType) == 0,
                 "Return type not covered by variant. Add "

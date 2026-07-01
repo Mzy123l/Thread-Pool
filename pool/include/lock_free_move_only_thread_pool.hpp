@@ -5,9 +5,7 @@
 // 使用 std::move_only_function<void()> 进行类型擦除，支持捕获
 // move-only 对象（如 std::unique_ptr）。
 // 需要 C++23 或支持 __cpp_lib_move_only_function 的编译器。
-// 可通过 QueueType 模板参数替换底层队列实现。
-// 分配器类型从 QueueType::allocator_type 推导，
-// 参照 std::priority_queue 设计。
+// 支持批量入队（BatchMode）和 CPU 亲和性（AffinityMode）。
 // ============================================================
 
 #include "lock_free_queue.hpp"
@@ -28,21 +26,36 @@ namespace thread_pool
 template <
     typename QueueType =
         lock_free_container::LockFreeQueue<
-            std::move_only_function<void()>>>
+            std::move_only_function<void()>>,
+    BatchMode BatchV = BatchMode::Disabled,
+    AffinityMode AffinityV = AffinityMode::Disabled>
 class DynamicMoveOnlyThreadPool
     : public LockFreeThreadPoolBase<
           std::move_only_function<void()>,
-          DynamicMoveOnlyThreadPool<QueueType>,
-          QueueType>
+          DynamicMoveOnlyThreadPool<QueueType,
+                                     BatchV,
+                                     AffinityV>,
+          QueueType,
+          BatchV,
+          AffinityV>
 {
     using Base = LockFreeThreadPoolBase<
         std::move_only_function<void()>,
-        DynamicMoveOnlyThreadPool<QueueType>,
-        QueueType>;
+        DynamicMoveOnlyThreadPool<QueueType,
+                                   BatchV,
+                                   AffinityV>,
+        QueueType,
+        BatchV,
+        AffinityV>;
     friend Base;
 
 public:
     using Base::Base;
+
+    ~DynamicMoveOnlyThreadPool()
+    {
+        this->ensure_batch_flushed();
+    }
 
     template <typename Func, typename... Args>
     auto submit(Func&& func, Args&&... args)
@@ -67,7 +80,14 @@ public:
         std::move_only_function<void()> wrapper = [task]()
         { (*task)(); };
 
-        this->enqueue_task(std::move(wrapper));
+        if constexpr (BatchV == BatchMode::Enabled)
+        {
+            this->enqueue_task_batch(std::move(wrapper));
+        }
+        else
+        {
+            this->enqueue_task(std::move(wrapper));
+        }
         return result;
     }
 
@@ -79,7 +99,6 @@ private:
 };
 
 // 向后兼容别名
-// 用户可指定分配器：LockFreeMoveOnlyThreadPool<MyAlloc>
 template <
     typename Alloc =
         std::allocator<std::move_only_function<void()>>>

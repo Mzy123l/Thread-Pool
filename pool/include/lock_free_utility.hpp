@@ -9,6 +9,8 @@
 // ============================================================
 
 #include <cstddef>
+#include <cstdint>
+#include <thread>
 #include <type_traits>
 #include <variant>
 
@@ -60,6 +62,43 @@ inline constexpr std::size_t kCacheLineSize = 64;
 #define POOL_ALWAYS_INLINE inline
 #define POOL_NOINLINE
 #endif
+
+// ============================================================
+// CAS 自旋等待提示（避免忙等占用流水线）
+// ============================================================
+// x86: PAUSE 指令，提示 CPU 当前在自旋锁循环中
+// ARM: YIELD 指令，类似效果
+// 其他平台降级为空操作
+#if (defined(__GNUC__) || defined(__clang__)) \
+    && (defined(__x86_64__) || defined(__i386__))
+#define POOL_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define POOL_PAUSE() __asm__ __volatile__("yield")
+#else
+#define POOL_PAUSE() ((void)0)
+#endif
+
+// ============================================================
+// thread_pool 命名空间 — 枚举配置项
+// ============================================================
+namespace thread_pool
+{
+
+/// @brief 批量入队模式：是否启用内部任务批量化
+enum class BatchMode
+{
+    Disabled,  ///< 逐个入队（默认）
+    Enabled    ///< 累积批次后批量入队（减少 CAS 次数）
+};
+
+/// @brief CPU 亲和性模式：是否将工作线程绑定到指定核心
+enum class AffinityMode
+{
+    Disabled,  ///< 由 OS 调度（默认）
+    Enabled    ///< 绑定工作线程到连续物理核心
+};
+
+}  // namespace thread_pool
 
 // ============================================================
 // 编译期工具：类型是否在 variant 中

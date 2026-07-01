@@ -3,18 +3,16 @@
 // lock_free_thread_pool_base.hpp — 无锁线程池 CRTP 基类
 // ============================================================
 // 提取三种线程池变体的公共逻辑：
-//   - 工作线程管理
-//   - 任务队列交互（支持有界/无界队列）
-//   - 统计计数器
-//   - 生命周期控制（shutdown / wait_all）
+//   - 工作线程管理 / 任务队列交互 / 统计 / 生命周期
+//
+// 模板参数：
+//   FuncType  — 队列元素类型
+//   Derived   — CRTP 后代类
+//   QueueType — 无锁队列类型
+//   BatchV    — 批量入队模式（Disabled / Enabled）
+//   AffinityV — CPU 亲和性绑定（Disabled / Enabled）
 //
 // 派生类仅需实现 submit() 和 execute_task() 两个方法。
-// 通过 CRTP 实现编译期多态，零虚函数开销。
-//
-// 分配器设计参照 std::priority_queue：
-//   - allocator_type 从底层队列类型推导
-//   - 构造时透传分配器实例给队列
-//   - 与队列共享同一分配器（经 rebind 用于 packaged_task）
 // ============================================================
 
 #include "lock_free_queue.hpp"
@@ -22,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -30,45 +29,80 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 namespace thread_pool
 {
 
 // ============================================================
-// LockFreeThreadPoolBase — CRTP 基类
+// 每线程统计槽位（独立缓存行，消除 false sharing）
 // ============================================================
-// 模板参数：
-//   FuncType  — 队列元素类型（std::function<void()>、variant 等）
-//   Derived   — CRTP 后代类（编译期多态）
-//   QueueType — 无锁队列类型，默认 LockFreeQueue<FuncType>
-//               分配器类型从 QueueType::allocator_type 推导
+// 每个工作线程拥有独立的统计槽位，写入无原子操作开销，
+// 查询时聚合所有槽位。
+struct alignas(lock_free_util::kCacheLineSize) ThreadStatSlot
+{
+    std::atomic<std::size_t> tasks_completed{0};
+
+    ThreadStatSlot() = default;
+    ThreadStatSlot(ThreadStatSlot&& other) noexcept
+        : tasks_completed(other.tasks_completed.load(
+              std::memory_order_relaxed))
+    {
+    }
+    ThreadStatSlot& operator=(ThreadStatSlot&& other) noexcept
+    {
+        tasks_completed.store(
+            other.tasks_completed.load(
+                std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        return *this;
+    }
+};
+
+// ============================================================
+// LockFreeThreadPoolBase — CRTP 基类
 // ============================================================
 template <typename FuncType, typename Derived,
           typename QueueType =
-              lock_free_container::LockFreeQueue<FuncType>>
+              lock_free_container::LockFreeQueue<FuncType>,
+          BatchMode BatchV = BatchMode::Disabled,
+          AffinityMode AffinityV = AffinityMode::Disabled>
 class LockFreeThreadPoolBase
 {
 public:
     using Task = FuncType;
-
-    /// @brief 分配器类型，从队列类型推导（同 std::priority_queue 约定）
     using allocator_type = typename QueueType::allocator_type;
 
+    // CAS 退避策略常量
+    static constexpr int kPauseThreshold = 8;
+    static constexpr int kYieldThreshold = 32;
+
     // ---- 构造 ----
-    // @param num_threads 工作线程数（默认 = 硬件并发数）
-    // @param alloc       分配器实例，透传给底层队列
     explicit LockFreeThreadPoolBase(
         std::size_t num_threads =
             std::thread::hardware_concurrency(),
         const allocator_type& alloc = allocator_type())
-        : task_queue_(alloc), task_allocator_(alloc), stop_{false},
+        : task_queue_(alloc), task_allocator_(alloc),
+          worker_stats_(num_threads + 1), stop_{false},
           active_tasks_{0}, total_tasks_{0}, completed_tasks_{0}
     {
+        // 每线程统计槽位在初始化列表中已构造 (num_threads + 1 个)
+        // 槽位 0 保留给主生产者
+
         workers_.reserve(num_threads);
         for (std::size_t i = 0; i < num_threads; ++i)
         {
             workers_.emplace_back(
-                [this]
-                { this->worker_thread(); });
+                [this, worker_id = i + 1]
+                { this->worker_thread(worker_id); });
+        }
+
+        // CPU 亲和性绑定
+        if constexpr (AffinityV == AffinityMode::Enabled)
+        {
+            apply_affinity();
         }
     }
 
@@ -86,15 +120,14 @@ public:
     // ---- 等待所有活跃任务完成 ----
     void wait_all()
     {
-        while (
-            POOL_UNLIKELY(active_tasks_.load(std::memory_order_acquire)
-                          > 0))
+        while (POOL_UNLIKELY(
+            active_tasks_.load(std::memory_order_acquire) > 0))
         {
             std::this_thread::yield();
         }
     }
 
-    // ---- 优雅关闭：等待进行中任务完成，不再接受新任务 ----
+    // ---- 优雅关闭 ----
     void shutdown()
     {
         stop_.store(true, std::memory_order_release);
@@ -147,7 +180,15 @@ public:
 
     std::size_t completed_count() const noexcept
     {
-        return completed_tasks_.load(std::memory_order_relaxed);
+        // 聚合所有工作线程的完成数 + 关机时直接累加的值
+        std::size_t sum = completed_tasks_.load(
+            std::memory_order_relaxed);
+        for (const auto& s : worker_stats_)
+        {
+            sum += s.tasks_completed.load(
+                std::memory_order_relaxed);
+        }
+        return sum;
     }
 
     std::size_t thread_count() const noexcept
@@ -155,38 +196,108 @@ public:
         return workers_.size();
     }
 
-    /// @brief 获取分配器副本（同 std::priority_queue 约定）
     allocator_type get_allocator() const noexcept
     {
         return task_allocator_;
     }
 
 protected:
-    // ---- 入队任务（供派生类 submit() 调用） ----
-    // 重试语义：有界队列满时自旋等待。
-    // 安全前提：队列的 enqueue 在失败时不得消费 task 实参。
+    // ---- 渐进退避（非批量模式使用） ----
+    static void backoff(int spin_count) noexcept
+    {
+        if (spin_count <= kPauseThreshold)
+        {
+            POOL_PAUSE();
+        }
+        else if (spin_count <= kYieldThreshold)
+        {
+            std::this_thread::yield();
+        }
+        else if (spin_count <= 128)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(1));
+        }
+    }
+
+    // ---- 单任务入队（带退避） ----
+    // 多生产者安全：任何线程调用 submit() 均可正确入队。
     void enqueue_task(Task task)
     {
         total_tasks_.fetch_add(1, std::memory_order_relaxed);
         active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
-        while (POOL_UNLIKELY(!task_queue_.enqueue(std::move(task))))
+        int spin = 0;
+        while (POOL_UNLIKELY(
+            !task_queue_.enqueue(std::move(task))))
         {
-            std::this_thread::yield();
+            backoff(spin++);
         }
     }
 
-    // 数据成员（protected 允许派生类访问）
-    // 注意：task_allocator_ 必须在 task_queue_ 之后声明，
-    // 因为分配器由队列构造时同步初始化
+    // ---- 批量入队（BatchMode::Enabled 时使用） ----
+    // 累积任务到本地缓冲区，满时批量提交到队列。
+    // 减少 CAS 次数至原来的 1/N。
+    static constexpr std::size_t kBatchSize = 64;
+    Task batch_buffer_[kBatchSize];
+    std::size_t batch_count_{0};
+
+    void enqueue_task_batch(Task task)
+    {
+        total_tasks_.fetch_add(1, std::memory_order_relaxed);
+        active_tasks_.fetch_add(1, std::memory_order_relaxed);
+
+        batch_buffer_[batch_count_++] = std::move(task);
+
+        if (POOL_UNLIKELY(batch_count_ >= kBatchSize))
+        {
+            flush_batch();
+        }
+    }
+
+    // 强制提交缓冲区中所有任务
+    void flush_batch()
+    {
+        if (batch_count_ == 0) return;
+
+        // 尝试批量入队
+        size_t written = task_queue_.enqueue_batch(
+            batch_buffer_, batch_count_);
+
+        // 处理剩余未能入队的任务（队列满，逐个入队）
+        for (size_t i = written; i < batch_count_; ++i)
+        {
+            int spin = 0;
+            while (POOL_UNLIKELY(
+                !task_queue_.enqueue(
+                    std::move(batch_buffer_[i]))))
+            {
+                backoff(spin++);
+            }
+        }
+        batch_count_ = 0;
+    }
+
+    // 确保析构前缓冲区被清空
+    void ensure_batch_flushed()
+    {
+        if constexpr (BatchV == BatchMode::Enabled)
+        {
+            flush_batch();
+        }
+    }
+
+    // 数据成员
     QueueType task_queue_;
     allocator_type task_allocator_;
     std::vector<std::thread> workers_;
 
-    // 以下原子变量各自占据独立缓存行，消除 false sharing：
-    // 轻量任务场景下，所有线程高频更新这些计数器，
-    // 若在同一缓存行会导致互相 invalidate，线程越多越慢。
-    alignas(lock_free_util::kCacheLineSize) std::atomic<bool> stop_;
+    // 每线程统计槽位（槽位 0 保留，1..N 对应工作线程）
+    std::vector<ThreadStatSlot> worker_stats_;
+
+    // 全局原子计数器（生产者侧使用，保持简单）
+    alignas(lock_free_util::kCacheLineSize)
+        std::atomic<bool> stop_;
     alignas(lock_free_util::kCacheLineSize)
         std::atomic<std::size_t> active_tasks_;
     alignas(lock_free_util::kCacheLineSize)
@@ -195,11 +306,41 @@ protected:
         std::atomic<std::size_t> completed_tasks_;
 
 private:
+    // ---- CPU 亲和性绑定 ----
+    void apply_affinity() noexcept
+    {
+#if defined(__linux__)
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+
+        unsigned int num_cores =
+            std::thread::hardware_concurrency();
+        for (unsigned int i = 0; i < num_cores && i < workers_.size(); ++i)
+        {
+            CPU_SET(static_cast<int>(i), &cpuset);
+        }
+
+        for (std::size_t i = 0; i < workers_.size(); ++i)
+        {
+            // 每个工作线程绑定到不同核心（i % num_cores）
+            cpu_set_t thread_set;
+            CPU_ZERO(&thread_set);
+            CPU_SET(static_cast<int>(i % num_cores), &thread_set);
+
+            pthread_t native_handle =
+                workers_[i].native_handle();
+            pthread_setaffinity_np(
+                native_handle, sizeof(cpu_set_t), &thread_set);
+        }
+#endif
+        // 非 Linux 平台静默降级（无操作）
+    }
+
     // ---- 工作线程主循环 ----
-    // CRTP 分发点：dequeue 后调用 Derived::execute_task()
-    void worker_thread()
+    void worker_thread(std::size_t worker_id)
     {
         Derived* derived = static_cast<Derived*>(this);
+        ThreadStatSlot& my_stats = worker_stats_[worker_id];
 
         while (POOL_UNLIKELY(
                    !stop_.load(std::memory_order_acquire))
@@ -214,18 +355,29 @@ private:
                 }
                 catch (...)
                 {
-                    // 异常由 packaged_task::get_future() 传播给调用方
+                    // 异常由 packaged_task::get_future() 传播
                 }
-                completed_tasks_.fetch_add(1,
-                                           std::memory_order_relaxed);
-                active_tasks_.fetch_sub(1,
-                                        std::memory_order_relaxed);
+                // 写入本地统计槽位（无竞争，独立缓存行）
+                my_stats.tasks_completed.fetch_add(
+                    1, std::memory_order_relaxed);
+                active_tasks_.fetch_sub(
+                    1, std::memory_order_relaxed);
             }
             else
             {
+                // 队列空，退避
                 std::this_thread::yield();
             }
         }
+
+        // 线程退出时，将本地计数归并到全局计数器
+        std::size_t completed =
+            my_stats.tasks_completed.load(
+                std::memory_order_relaxed);
+        completed_tasks_.fetch_add(
+            completed, std::memory_order_relaxed);
+        my_stats.tasks_completed.store(
+            0, std::memory_order_relaxed);
     }
 };
 

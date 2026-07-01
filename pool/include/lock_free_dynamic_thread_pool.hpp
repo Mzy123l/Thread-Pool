@@ -4,6 +4,7 @@
 // ============================================================
 // 使用 std::function<void()> 进行类型擦除，支持任意可调用对象 +
 // 参数绑定。可通过 QueueType 模板参数替换底层队列实现。
+// 支持批量入队（BatchMode）和 CPU 亲和性（AffinityMode）。
 // 分配器类型从 QueueType::allocator_type 推导，
 // 参照 std::priority_queue 设计。
 // ============================================================
@@ -22,24 +23,38 @@ namespace thread_pool
 
 template <
     typename QueueType =
-        lock_free_container::LockFreeQueue<std::function<void()>>>
+        lock_free_container::LockFreeQueue<std::function<void()>>,
+    BatchMode BatchV = BatchMode::Disabled,
+    AffinityMode AffinityV = AffinityMode::Disabled>
 class DynamicThreadPool
     : public LockFreeThreadPoolBase<std::function<void()>,
-                                    DynamicThreadPool<QueueType>,
-                                    QueueType>
+                                    DynamicThreadPool<QueueType,
+                                                      BatchV,
+                                                      AffinityV>,
+                                    QueueType,
+                                    BatchV,
+                                    AffinityV>
 {
     using Base =
         LockFreeThreadPoolBase<std::function<void()>,
-                               DynamicThreadPool<QueueType>,
-                               QueueType>;
+                               DynamicThreadPool<QueueType,
+                                                 BatchV,
+                                                 AffinityV>,
+                               QueueType,
+                               BatchV,
+                               AffinityV>;
     friend Base;
 
 public:
     using Base::Base;
 
-    // ---- 提交任务 ----
-    // 将可调用对象 + 参数包装为 std::function<void()> 后入队，
-    // 返回 std::future<ReturnType>
+    // ---- 析构：确保批量缓冲区被清空 ----
+    ~DynamicThreadPool()
+    {
+        this->ensure_batch_flushed();
+    }
+
+    // ---- 提交任务（多生产者安全） ----
     template <typename Func, typename... Args>
     auto submit(Func&& func, Args&&... args)
         -> std::future<
@@ -63,7 +78,14 @@ public:
         std::function<void()> wrapper = [task]()
         { (*task)(); };
 
-        this->enqueue_task(std::move(wrapper));
+        if constexpr (BatchV == BatchMode::Enabled)
+        {
+            this->enqueue_task_batch(std::move(wrapper));
+        }
+        else
+        {
+            this->enqueue_task(std::move(wrapper));
+        }
         return result;
     }
 
@@ -75,8 +97,6 @@ private:
 };
 
 // 向后兼容别名
-// 用户可指定分配器：LockFreeThreadPool<MyAlloc>
-// 等价于 DynamicThreadPool<LockFreeQueue<Func, MyAlloc>>
 template <
     typename Alloc =
         std::allocator<std::function<void()>>>

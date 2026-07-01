@@ -13,9 +13,11 @@
 #include "lock_free_utility.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -114,6 +116,27 @@ class LockFreeQueue
 
         static thread_local Node* toDeallocate_;
 
+        // CAS 退避策略常量
+        static constexpr int kPauseThreshold = 8;
+        static constexpr int kYieldThreshold = 32;
+
+        static void backoff(int spin_count) noexcept
+        {
+            if (spin_count <= kPauseThreshold)
+            {
+                POOL_PAUSE();
+            }
+            else if (spin_count <= kYieldThreshold)
+            {
+                std::this_thread::yield();
+            }
+            else if (spin_count <= 128)
+            {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(1));
+            }
+        }
+
     public:
         LockFreeQueue(const Allocator& alloc = Allocator())
             : allocator_(alloc), valueAllocator_(alloc)
@@ -180,6 +203,7 @@ class LockFreeQueue
                 throw;
             }
 
+            int spin = 0;
             while (true)
             {
                 inner_queue::DoubleWord tail = tail_.load(std::memory_order_acquire);
@@ -189,6 +213,7 @@ class LockFreeQueue
 
                 if (POOL_UNLIKELY(tail != tail_.load(std::memory_order_acquire)))
                 {
+                    backoff(++spin);
                     continue;
                 }
 
@@ -206,6 +231,7 @@ class LockFreeQueue
                             std::memory_order_relaxed);
                         return true;
                     }
+                    backoff(++spin);
                 }
                 else
                 {
@@ -214,13 +240,14 @@ class LockFreeQueue
                         tail, newTail,
                         std::memory_order_release,
                         std::memory_order_relaxed);
+                    spin = 0;  // 推进 tail 是帮助操作，非竞争
                 }
             }
         }
 
-        // 出队
         bool dequeue(T& data)
         {
+            int spin = 0;
             while (true)
             {
                 inner_queue::DoubleWord tail = tail_.load(std::memory_order_acquire);
@@ -232,6 +259,7 @@ class LockFreeQueue
 
                 if (POOL_UNLIKELY(head != head_.load(std::memory_order_acquire)))
                 {
+                    backoff(++spin);
                     continue;
                 }
 
@@ -241,6 +269,7 @@ class LockFreeQueue
                     {
                         if (POOL_UNLIKELY(tail != tail_.load(std::memory_order_acquire)))
                         {
+                            backoff(++spin);
                             continue;
                         }
                         return false;
@@ -251,11 +280,13 @@ class LockFreeQueue
                         tail, newTail,
                         std::memory_order_release,
                         std::memory_order_relaxed);
+                    spin = 0;
                 }
                 else
                 {
                     if (POOL_UNLIKELY(next == nullptr))
                     {
+                        backoff(++spin);
                         continue;
                     }
 
@@ -283,6 +314,7 @@ class LockFreeQueue
 
                         return true;
                     }
+                    backoff(++spin);
                 }
             }
         }

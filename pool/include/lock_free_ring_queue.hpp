@@ -11,11 +11,14 @@
 //   Allocator— 分配器类型
 //
 // 接口与 LockFreeQueue 对齐，enqueue 满时返回 false。
+// 新增批量入队/出队（enqueue_batch / dequeue_batch），
+// CAS 重试循环内建渐进退避策略。
 // ============================================================
 
 #include "lock_free_utility.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,9 +29,6 @@
 namespace lock_free_container
 {
 
-// ============================================================
-// 环形队列默认分配器（复用 inner_queue 的实现模式）
-// ============================================================
 namespace inner_ring
 {
 template <typename T>
@@ -72,7 +72,6 @@ template <typename T,
 class LockFreeRingQueue
 {
 public:
-    /// @brief 分配器类型（队列元素 T 的分配器）
     using allocator_type = Allocator;
 
 private:
@@ -80,7 +79,10 @@ private:
     static_assert((Capacity & (Capacity - 1)) == 0,
                   "Capacity 必须是 2 的幂");
 
-private:
+    // CAS 退避策略常量
+    static constexpr int kPauseThreshold = 8;    // 先 PAUSE 自旋
+    static constexpr int kYieldThreshold = 32;   // 再 yield 让出
+
     struct alignas(lock_free_util::kCacheLineSize) Cell
     {
         std::atomic<std::size_t> sequence;
@@ -101,20 +103,37 @@ private:
         typename std::allocator_traits<Allocator>::template rebind_alloc<Cell>;
     using CellAllocTraits = std::allocator_traits<CellAllocator>;
 
-    Cell* buffer_;     // 环形缓冲区
+    Cell* buffer_;
     CellAllocator cell_allocator_;
 
-    // 单调递增的位置计数器，不同缓存行避免 false sharing
     alignas(lock_free_util::kCacheLineSize)
         std::atomic<std::size_t> enqueue_pos_{0};
     alignas(lock_free_util::kCacheLineSize)
         std::atomic<std::size_t> dequeue_pos_{0};
 
-    // ---- 索引计算 ----
     static constexpr std::size_t mask_ = Capacity - 1;
     static std::size_t index(std::size_t pos) noexcept
     {
         return pos & mask_;
+    }
+
+    // ---- 渐进退避（CAS 重试时调用） ----
+    static void backoff(int spin_count) noexcept
+    {
+        if (spin_count <= kPauseThreshold)
+        {
+            POOL_PAUSE();
+        }
+        else if (spin_count <= kYieldThreshold)
+        {
+            std::this_thread::yield();
+        }
+        // 长时间仍失败则短暂休眠
+        else if (spin_count <= 128)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(1));
+        }
     }
 
 public:
@@ -123,7 +142,6 @@ public:
         : buffer_(nullptr), cell_allocator_(alloc)
     {
         buffer_ = CellAllocTraits::allocate(cell_allocator_, Capacity);
-        // 初始化所有槽位的序列号
         for (std::size_t i = 0; i < Capacity; ++i)
         {
             buffer_[i].sequence.store(i, std::memory_order_relaxed);
@@ -133,7 +151,6 @@ public:
     LockFreeRingQueue(const LockFreeRingQueue&) = delete;
     LockFreeRingQueue& operator=(const LockFreeRingQueue&) = delete;
 
-    // 移动构造：接管缓冲区
     LockFreeRingQueue(LockFreeRingQueue&& other) noexcept
         : buffer_(other.buffer_)
         , cell_allocator_(std::move(other.cell_allocator_))
@@ -159,11 +176,13 @@ public:
         }
     }
 
+    // ---- 单元素入队（带 CAS 退避） ----
     template <typename... Args>
     bool enqueue(Args&&... args)
     {
         std::size_t pos =
             enqueue_pos_.load(std::memory_order_relaxed);
+        int spin = 0;
 
         for (;;)
         {
@@ -171,13 +190,11 @@ public:
             std::size_t seq =
                 cell->sequence.load(std::memory_order_acquire);
 
-            // diff==0空闲/ <0满/ >0其他生产者占用
             auto diff = static_cast<std::intptr_t>(seq)
                         - static_cast<std::intptr_t>(pos);
 
             if (POOL_LIKELY(diff == 0))
             {
-                // 尝试占据此位置
                 if (POOL_LIKELY(enqueue_pos_.compare_exchange_weak(
                         pos, pos + 1, std::memory_order_relaxed,
                         std::memory_order_relaxed)))
@@ -188,24 +205,30 @@ public:
                                          std::memory_order_release);
                     return true;
                 }
+                // CAS 失败 → 退避后重试
+                backoff(spin++);
             }
             else if (POOL_UNLIKELY(diff < 0))
             {
-                return false;
+                return false;  // 队列满，不重试
             }
             else
             {
+                // 其他生产者领先，刷新 pos
                 POOL_PREFETCH_W(&buffer_[index(pos + 1)]);
                 pos = enqueue_pos_.load(
                     std::memory_order_relaxed);
+                spin = 0;  // 重置计数（非同一槽位竞争）
             }
         }
     }
 
+    // ---- 单元素出队（带 CAS 退避） ----
     bool dequeue(T& data)
     {
         std::size_t pos =
             dequeue_pos_.load(std::memory_order_relaxed);
+        int spin = 0;
 
         for (;;)
         {
@@ -213,7 +236,6 @@ public:
             std::size_t seq =
                 cell->sequence.load(std::memory_order_acquire);
 
-            // diff==0有数据/ <0空/ >0其他消费者占用
             auto diff = static_cast<std::intptr_t>(seq)
                         - static_cast<std::intptr_t>(pos + 1);
 
@@ -229,21 +251,116 @@ public:
                                          std::memory_order_release);
                     return true;
                 }
+                // CAS 失败 → 退避后重试
+                backoff(spin++);
             }
             else if (POOL_UNLIKELY(diff < 0))
             {
-                return false;
+                return false;  // 队列空
             }
             else
             {
                 POOL_PREFETCH_R(&buffer_[index(pos + 1)]);
                 pos = dequeue_pos_.load(
                     std::memory_order_relaxed);
+                spin = 0;
             }
         }
     }
 
-    // ---- 清空（非线程安全，应在无并发时调用） ----
+    // ---- 批量入队 ----
+    // 原子地预留 count 个连续槽位并写入数据。
+    // 若可用槽位不足 count，写入 min(count, available) 个。
+    // 返回实际入队数量（可能 < count）。
+    // 不会丢失任务：要么全部预留成功，要么预留实际可用数量。
+    size_t enqueue_batch(T* items, size_t count)
+    {
+        if (POOL_UNLIKELY(count == 0)) return 0;
+
+        std::size_t pos =
+            enqueue_pos_.load(std::memory_order_relaxed);
+        int spin = 0;
+
+        for (;;)
+        {
+            // 检查连续可用槽位数
+            size_t avail = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                Cell* cell = &buffer_[index(pos + i)];
+                std::size_t seq =
+                    cell->sequence.load(std::memory_order_acquire);
+                if (seq != pos + i) break;  // 不可用
+                ++avail;
+            }
+            if (avail == 0) return 0;  // 队列满
+
+            // 原子预留 avail 个槽位
+            if (POOL_LIKELY(enqueue_pos_.compare_exchange_weak(
+                    pos, pos + avail, std::memory_order_relaxed,
+                    std::memory_order_relaxed)))
+            {
+                // 写入数据并发布序列号
+                for (size_t i = 0; i < avail; ++i)
+                {
+                    Cell* cell = &buffer_[index(pos + i)];
+                    ::new (cell->storage)
+                        T(std::move(items[i]));
+                    cell->sequence.store(pos + i + 1,
+                                         std::memory_order_release);
+                }
+                return avail;
+            }
+            // CAS 失败 → 退避
+            backoff(spin++);
+        }
+    }
+
+    // ---- 批量出队 ----
+    // 原子地预留 count 个连续槽位并读取数据。
+    // 若可用数据不足 count，读取 min(count, available) 个。
+    // 返回实际出队数量（可能 < count）。
+    size_t dequeue_batch(T* items, size_t count)
+    {
+        if (POOL_UNLIKELY(count == 0)) return 0;
+
+        std::size_t pos =
+            dequeue_pos_.load(std::memory_order_relaxed);
+        int spin = 0;
+
+        for (;;)
+        {
+            // 检查连续可用数据槽位数
+            size_t avail = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                Cell* cell = &buffer_[index(pos + i)];
+                std::size_t seq =
+                    cell->sequence.load(std::memory_order_acquire);
+                if (seq != pos + i + 1) break;  // 无数据
+                ++avail;
+            }
+            if (avail == 0) return 0;  // 队列空
+
+            if (POOL_LIKELY(dequeue_pos_.compare_exchange_weak(
+                    pos, pos + avail, std::memory_order_relaxed,
+                    std::memory_order_relaxed)))
+            {
+                for (size_t i = 0; i < avail; ++i)
+                {
+                    Cell* cell = &buffer_[index(pos + i)];
+                    items[i] = std::move(*cell->data());
+                    cell->data()->~T();
+                    cell->sequence.store(pos + i + Capacity,
+                                         std::memory_order_release);
+                }
+                return avail;
+            }
+            backoff(spin++);
+        }
+    }
+
+    // ---- 清空（非线程安全） ----
     void clear() noexcept
     {
         T dummy;
