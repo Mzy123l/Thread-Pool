@@ -469,7 +469,7 @@ public:
 
     ~StrictVariantThreadPool()
     {
-        this->ensure_batch_flushed();
+        // batch flush removed
     }
 
     template <typename Func, typename... Args>
@@ -499,7 +499,7 @@ public:
 
         if constexpr (BatchV == BatchMode::Enabled)
         {
-            this->enqueue_task_batch(std::move(variant_task));
+            this->enqueue_task(std::move(variant_task));
         }
         else
         {

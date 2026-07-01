@@ -262,57 +262,9 @@ protected:
         }
     }
 
-    // ---- 批量入队（BatchMode::Enabled 时使用） ----
-    // 累积任务到本地缓冲区，满时批量提交到队列。
-    // 减少 CAS 次数至原来的 1/N。
-    static constexpr std::size_t kBatchSize = 64;
-    Task batch_buffer_[kBatchSize];
-    std::size_t batch_count_{0};
-
-    void enqueue_task_batch(Task task)
-    {
-        total_tasks_.fetch_add(1, std::memory_order_relaxed);
-        active_tasks_.fetch_add(1, std::memory_order_acquire);
-
-        batch_buffer_[batch_count_++] = std::move(task);
-
-        if (POOL_UNLIKELY(batch_count_ >= kBatchSize))
-        {
-            flush_batch();
-        }
-    }
-
-    // 强制提交缓冲区中所有任务
-    void flush_batch()
-    {
-        if (batch_count_ == 0) return;
-
-        // 尝试批量入队
-        size_t written = task_queue_.enqueue_batch(
-            batch_buffer_, batch_count_);
-
-        // 处理剩余未能入队的任务（队列满，逐个入队）
-        for (size_t i = written; i < batch_count_; ++i)
-        {
-            int spin = 0;
-            while (POOL_UNLIKELY(
-                !task_queue_.enqueue(
-                    std::move(batch_buffer_[i]))))
-            {
-                backoff(spin++);
-            }
-        }
-        batch_count_ = 0;
-    }
-
-    // 确保析构前缓冲区被清空
-    void ensure_batch_flushed()
-    {
-        if constexpr (BatchV == BatchMode::Enabled)
-        {
-            flush_batch();
-        }
-    }
+    // ---- dequeue_batch 辅助（BatchMode::Enabled 时在 worker_thread 中使用） ----
+    // 本类不缓存入队任务（enqueue 始终单任务），只通过 BatchMode 控制
+    // worker_thread 的 dequeue_batch 行为。
 
     // 数据成员
     QueueType task_queue_;
@@ -399,37 +351,64 @@ private:
         Derived* derived = static_cast<Derived*>(this);
         ThreadStatSlot& my_stats = worker_stats_[worker_id];
 
+        // 批量出队缓冲区（BatchMode::Enabled 时使用）
+        static constexpr std::size_t kDeqBatch = 8;
+        Task local_batch_[kDeqBatch]{};
+
         while (POOL_UNLIKELY(
                    !stop_.load(std::memory_order_acquire))
                || active_tasks_.load(std::memory_order_acquire) > 0)
         {
-            Task task{};
-            if (POOL_LIKELY(task_queue_.dequeue(task)))
+            std::size_t batch_count = 0;
+
+            if constexpr (BatchV == BatchMode::Enabled)
             {
-                try
+                batch_count = task_queue_.dequeue_batch(
+                    local_batch_, kDeqBatch);
+            }
+
+            if (POOL_LIKELY(batch_count > 0))
+            {
+                for (std::size_t i = 0; i < batch_count; ++i)
                 {
-                    derived->execute_task(std::move(task));
+                    try
+                    {
+                        derived->execute_task(
+                            std::move(local_batch_[i]));
+                    }
+                    catch (...)
+                    {
+                    }
+                    my_stats.tasks_completed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    active_tasks_.fetch_sub(
+                        1, std::memory_order_release);
                 }
-                catch (...)
-                {
-                    // 异常由 packaged_task::get_future() 传播
-                }
-                // 写入本地统计槽位（无竞争，独立缓存行）
-                my_stats.tasks_completed.fetch_add(
-                    1, std::memory_order_relaxed);
-                // release 确保 shutdown_now / wait_all
-                // 的 acquire load 能看到递减
-                active_tasks_.fetch_sub(
-                    1, std::memory_order_release);
             }
             else
             {
-                // 队列空，退避
-                std::this_thread::yield();
+                Task task{};
+                if (POOL_LIKELY(task_queue_.dequeue(task)))
+                {
+                    try
+                    {
+                        derived->execute_task(std::move(task));
+                    }
+                    catch (...)
+                    {
+                    }
+                    my_stats.tasks_completed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    active_tasks_.fetch_sub(
+                        1, std::memory_order_release);
+                }
+                else
+                {
+                    std::this_thread::yield();
+                }
             }
         }
 
-        // 线程退出时，将本地计数归并到全局计数器
         std::size_t completed =
             my_stats.tasks_completed.load(
                 std::memory_order_relaxed);

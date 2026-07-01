@@ -51,7 +51,7 @@ public:
     // ---- 析构：确保批量缓冲区被清空 ----
     ~DynamicThreadPool()
     {
-        this->ensure_batch_flushed();
+        // batch flush removed
     }
 
     // ---- 提交任务（多生产者安全） ----
@@ -80,7 +80,7 @@ public:
 
         if constexpr (BatchV == BatchMode::Enabled)
         {
-            this->enqueue_task_batch(std::move(wrapper));
+            this->enqueue_task(std::move(wrapper));
         }
         else
         {
