@@ -96,8 +96,21 @@ add_pool_test(test_concurrency
 if(COMPILER_SUPPORTS_CXX23)
     add_pool_test(test_move_only
         pool/test/test_move_only.cpp cxx_std_23)
-    add_pool_test(test_compare
-        pool/test/compare_with_mutex_pool.cpp cxx_std_23)
+
+    # compare_with_mutex_pool 是独立 benchmark（自带 main），
+    # 不用 gtest_discover_tests，注册为普通 CTest
+    add_executable(test_compare
+        pool/test/compare_with_mutex_pool.cpp)
+    target_link_libraries(test_compare PRIVATE
+        thread_pool
+        Threads::Threads)
+    target_compile_features(test_compare PRIVATE cxx_std_23)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(test_compare PRIVATE -Wno-psabi)
+    endif()
+    add_test(NAME test_compare COMMAND test_compare
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
     message(STATUS "C++23 supported — move_only & compare tests enabled")
 else()
     message(STATUS "C++23 NOT supported — move_only & compare tests skipped")

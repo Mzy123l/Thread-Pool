@@ -182,10 +182,17 @@ protected:
     QueueType task_queue_;
     allocator_type task_allocator_;
     std::vector<std::thread> workers_;
-    std::atomic<bool> stop_;
-    std::atomic<std::size_t> active_tasks_;
-    std::atomic<std::size_t> total_tasks_;
-    std::atomic<std::size_t> completed_tasks_;
+
+    // 以下原子变量各自占据独立缓存行，消除 false sharing：
+    // 轻量任务场景下，所有线程高频更新这些计数器，
+    // 若在同一缓存行会导致互相 invalidate，线程越多越慢。
+    alignas(lock_free_util::kCacheLineSize) std::atomic<bool> stop_;
+    alignas(lock_free_util::kCacheLineSize)
+        std::atomic<std::size_t> active_tasks_;
+    alignas(lock_free_util::kCacheLineSize)
+        std::atomic<std::size_t> total_tasks_;
+    alignas(lock_free_util::kCacheLineSize)
+        std::atomic<std::size_t> completed_tasks_;
 
 private:
     // ---- 工作线程主循环 ----
