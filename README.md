@@ -234,58 +234,60 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 ## 性能
 
-以下数据基于 16 物理核心（32 逻辑线程），GCC 15.2，-O3，12 工作线程：
+以下数据基于 16 物理核心（32 逻辑线程，WSL 限 24），GCC 15.2，-O3：
 
-| 场景 | 有锁线程池 | function | move_only | variant | 最佳加速比 |
-|------|-----------|----------|-----------|---------|-----------|
+### 基准对比（12 工作线程）
+
+| 场景 | 有锁线程池 | function+环形 | move_only+环形 | variant+环形 | 最佳加速比 |
+|------|-----------|--------------|----------------|-------------|-----------|
 | 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | **94×** |
 | 重量任务 (1000) | 13 ms | 5.4 ms | 5.5 ms | 5.6 ms | **2.5×** |
 | IO 混合 (10000) | 93 ms | 92 ms | 92 ms | 92 ms | 1.01× |
 
 > 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
-> 表格中 function/move_only/variant 使用环形队列（`LockFreeRingQueue`，容量 65536），
-> 链表队列版本耗时约为环形队列的 1.6–2×（轻量任务）。
+> 链表队列版本在轻量任务中耗时约为环形队列的 1.6–2×（每次入队需堆分配）。
 
-### 各线程数性能趋势
-
-以 variant + 环形队列为例（耗时越低越好）：
+### 各线程数扩展性（variant + 环形队列）
 
 | 场景 | 2线程 | 4线程 | 6线程 | 8线程 | 12线程 | 16线程 | 24线程 | 32线程 |
 |------|------|------|------|------|-------|-------|-------|-------|
-| 轻量任务 (ms) | 34 | **19** | 19 | 27 | 36 | 38 | 66 | 73 |
-| 重量任务 (ms) | 33 | 16 | 11 | 8.1 | 5.6 | 5.4 | 5.1 | 6.0 |
+| 轻量任务 (ms) | 36 | **19** | 20 | 28 | 38 | 40 | **50** | 74 |
+| 重量任务 (ms) | 33 | 16 | 11 | 8.1 | 5.4 | 5.0 | **4.3** | 5.0 |
 | IO混合 (ms) | 547 | 274 | 183 | 137 | 92 | 69 | 46 | **35** |
 
-### 可配置优化选项
+> 轻量任务最佳在 4–6 线程（主线程单生产者瓶颈），重量任务 24 线程最优，
+> IO 混合遵循 1/N 线性扩展。
 
-线程池支持两个编译期开关（通过模板参数传递）：
+### 性能要点
+
+- **轻量任务**：variant + 环形队列组合消除类型擦除且无堆分配，4 线程 94× 于有锁池。超过 6 线程后退化——主线程提交 250K 任务是硬瓶颈（~77ns/task），后续优化方向为 Work Stealing。
+- **重量任务**：任务执行（fib(25) 约 70μs）远大于调度开销，无锁池 24 线程达最佳；有锁池因互斥锁上下文切换在 12 线程后退化（效率从 100% 跌至 19%）。
+- **IO 混合**：瓶颈在 sleep(1ms)，实际 CPU 占用 ≈ 线程数的 10%，各池在 12 线程以下无差异，高线程数时无锁池因锁竞争更小逐渐领先。
+- **CAS 渐进退避**：24 线程场景下退避策略减少无效 CAS 重试，相比优化前提速约 23%（66ms → 50ms）。
+
+### 编译期配置
+
+线程池支持两个模板开关，位于 `thread_pool` 命名空间：
 
 | 选项 | 枚举值 | 说明 |
 |------|--------|------|
-| `BatchMode` | `Disabled`（默认）/ `Enabled` | 批量入队，将单任务提交聚合为批次后一次性推入队列，减少 CAS 次数 |
-| `AffinityMode` | `Disabled`（默认）/ `Enabled` | CPU 亲和性绑定，每个工作线程固定到独立物理核心，减少线程迁移 |
+| `BatchMode` | `Disabled`（默认）/ `Enabled` | 将任务聚合为批次一次性入队，减少 CAS 次数 |
+| `AffinityMode` | `Disabled`（默认）/ `Enabled` | Linux 下 `pthread_setaffinity_np` 绑定线程到不同核心 |
 
 ```cpp
-// 启用批量入队 + CPU 亲和性的 variant 线程池
 using MyVariant = std::variant<
     std::packaged_task<void()>,
     std::packaged_task<int()>,
     std::function<void()>
 >;
+using MyQ = lock_free_container::LockFreeRingQueue<MyVariant, 65536>;
 
-using MyQueue = lock_free_container::LockFreeRingQueue<MyVariant, 65536>;
-
-thread_pool::VariantThreadPool<
-    MyVariant, MyQueue,
+thread_pool::VariantThreadPool<MyVariant, MyQ,
     thread_pool::BatchMode::Enabled,
     thread_pool::AffinityMode::Enabled> pool(8);
 ```
 
-其他优化（无需用户配置，底层自动生效）：
-
-- **CAS 渐进退避**：CAS 失败时经 PAUSE → yield → sleep 三级退避，避免高竞争下 CPU 空转
-- **每线程统计**：工作线程的完成计数写入独立缓存行，消除 `completed_count()` 查询时的跨核心缓存弹跳
-- **多生产者支持**：`submit()` 可从任意线程安全调用（队列本身已是 MPMC）
+底层自动生效的优化：PAUSE→yield→sleep 三级 CAS 退避、每线程独立统计槽位消除 `completed_count()` 缓存弹跳、`submit()` 多生产者安全。
 
 - **轻量任务**：variant + 环形队列组合因编译期分发消除类型擦除、且环形队列无内存分配，性能最优（4线程时 94× 于有锁池）。但受主线程单生产者瓶颈限制，最佳线程数 4–6，超过后 CAS 竞争增加导致退化。环形队列比链表队列快 1.6–2×（省去每次 `new`/`delete`）。
 - **重量任务**：任务执行时间（fib(25) 约 70μs）远大于调度开销，无锁池在 16–24 线程达最佳，有锁池因互斥锁争用在 8 线程后退化。

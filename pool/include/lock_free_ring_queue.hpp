@@ -80,8 +80,10 @@ private:
                   "Capacity 必须是 2 的幂");
 
     // CAS 退避策略常量
-    static constexpr int kPauseThreshold = 8;    // 先 PAUSE 自旋
-    static constexpr int kYieldThreshold = 32;   // 再 yield 让出
+    // 阈值设得较高是因为极轻量任务 CAS 重试仅 ~10ns，
+    // 过早 PAUSE（~30ns）反而比立即重试更慢。
+    static constexpr int kPauseThreshold = 32;   // 先 PAUSE 自旋
+    static constexpr int kYieldThreshold = 256;  // 再 yield 让出
 
     struct alignas(lock_free_util::kCacheLineSize) Cell
     {

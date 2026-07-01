@@ -75,9 +75,9 @@ public:
     using Task = FuncType;
     using allocator_type = typename QueueType::allocator_type;
 
-    // CAS 退避策略常量
-    static constexpr int kPauseThreshold = 8;
-    static constexpr int kYieldThreshold = 32;
+    // CAS 退避策略常量（高阈值避免过早退避）
+    static constexpr int kPauseThreshold = 32;
+    static constexpr int kYieldThreshold = 256;
 
     // ---- 构造 ----
     explicit LockFreeThreadPoolBase(

@@ -116,9 +116,9 @@ class LockFreeQueue
 
         static thread_local Node* toDeallocate_;
 
-        // CAS 退避策略常量
-        static constexpr int kPauseThreshold = 8;
-        static constexpr int kYieldThreshold = 32;
+        // CAS 退避策略常量（高阈值避免过早退避）
+        static constexpr int kPauseThreshold = 32;
+        static constexpr int kYieldThreshold = 256;
 
         static void backoff(int spin_count) noexcept
         {
