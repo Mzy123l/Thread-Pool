@@ -12,8 +12,9 @@ pool/include/
 ├── lock_free_thread_pool_base.hpp        # CRTP 基类
 ├── lock_free_dynamic_thread_pool.hpp     # std::function 线程池
 ├── lock_free_move_only_thread_pool.hpp   # std::move_only_function 线程池 (C++23)
-├── lock_free_variant_thread_pool.hpp     # std::variant 线程池
-└── lock_free_thread_pool.hpp             # 汇总头（包含以上三种）
+├── lock_free_variant_thread_pool.hpp            # std::variant 线程池（packaged_task）
+├── lock_free_strict_variant_thread_pool.hpp     # std::variant 线程池（自实现 task/future）
+└── lock_free_thread_pool.hpp                    # 汇总头（包含以上四种）
 ```
 
 ## 快速开始
@@ -71,7 +72,7 @@ int v; queue.dequeue(v);    // 空时返回 false
 
 ## 线程池变体
 
-三种变体均基于 CRTP 基类，零虚函数开销，均可通过模板参数替换底层队列。
+四种变体均基于 CRTP 基类，零虚函数开销，均可通过模板参数替换底层队列。
 
 ### 1. DynamicThreadPool
 
@@ -155,6 +156,39 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
 | `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
+
+### 4. StrictVariantThreadPool
+
+自实现 `SimplePromise` / `SimpleFuture` / `SimplePackagedTask`，不依赖 `std::packaged_task` / `std::future`。`std::visit` 编译期分发，不包含 `std::function<void()>` 保底类型——返回类型必须精确匹配 variant 中的 `SimplePackagedTask<T()>`，否则编译失败。兼容 `-fno-rtti -fno-exceptions`。
+
+```cpp
+using StrictVariant = std::variant<
+    thread_pool::SimplePackagedTask<void>,
+    thread_pool::SimplePackagedTask<int>,
+    thread_pool::SimplePackagedTask<std::string>
+>;
+
+thread_pool::StrictVariantThreadPool<StrictVariant> pool(4);
+
+// 返回 int → 匹配 SimplePackagedTask<int()> ✓
+auto fut = pool.submit([] { return 42; });
+std::cout << fut.get();  // 42
+
+// 返回 double → 无匹配类型 → 编译错误 ✗
+// pool.submit([] { return 3.14; });
+```
+
+#### 模板参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `VariantType` | 无 | 任务 variant 类型，须包含对应返回类型的 `SimplePackagedTask<T()>` |
+| `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
+
+> 与 VariantThreadPool 的核心区别：自实现 task/future 替代 `std::packaged_task`/`std::future`；
+> 不保留 `std::function<void()>` 保底；无 RTTI、无异常依赖。
 
 ## 替换队列与分配器
 

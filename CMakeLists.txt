@@ -91,6 +91,8 @@ add_pool_test(test_thread_pool
     pool/test/test_thread_pool.cpp cxx_std_20)
 add_pool_test(test_concurrency
     pool/test/test_concurrency.cpp cxx_std_20)
+add_pool_test(test_strict_variant
+    pool/test/test_strict_variant.cpp cxx_std_20)
 
 # C++23 条件编译目标
 if(COMPILER_SUPPORTS_CXX23)

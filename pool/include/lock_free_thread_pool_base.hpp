@@ -252,7 +252,7 @@ protected:
     void enqueue_task(Task task)
     {
         total_tasks_.fetch_add(1, std::memory_order_relaxed);
-        active_tasks_.fetch_add(1, std::memory_order_relaxed);
+        active_tasks_.fetch_add(1, std::memory_order_acquire);
 
         int spin = 0;
         while (POOL_UNLIKELY(
@@ -272,7 +272,7 @@ protected:
     void enqueue_task_batch(Task task)
     {
         total_tasks_.fetch_add(1, std::memory_order_relaxed);
-        active_tasks_.fetch_add(1, std::memory_order_relaxed);
+        active_tasks_.fetch_add(1, std::memory_order_acquire);
 
         batch_buffer_[batch_count_++] = std::move(task);
 
@@ -417,8 +417,10 @@ private:
                 // 写入本地统计槽位（无竞争，独立缓存行）
                 my_stats.tasks_completed.fetch_add(
                     1, std::memory_order_relaxed);
+                // release 确保 shutdown_now / wait_all
+                // 的 acquire load 能看到递减
                 active_tasks_.fetch_sub(
-                    1, std::memory_order_relaxed);
+                    1, std::memory_order_release);
             }
             else
             {

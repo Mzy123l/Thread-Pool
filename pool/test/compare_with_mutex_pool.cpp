@@ -20,6 +20,7 @@
 #include "../include/lock_free_thread_pool.hpp"
 #include "../include/lock_free_move_only_thread_pool.hpp"
 #include "../include/lock_free_variant_thread_pool.hpp"
+#include "../include/lock_free_strict_variant_thread_pool.hpp"
 #include "../include/lock_free_ring_queue.hpp"
 
 // ======================== 有锁线程池 ========================
@@ -123,6 +124,12 @@ using BenchVariant = std::variant<
     std::function<void()>
 >;
 
+// StrictVariant 线程池的基准测试类型（自实现 task/future）
+using StrictBenchVariant = std::variant<
+    thread_pool::SimplePackagedTask<void>,
+    thread_pool::SimplePackagedTask<int>,
+    thread_pool::SimplePackagedTask<long long>>;
+
 // 环形队列容量（须为 2 的幂）
 constexpr std::size_t RING_CAPACITY = 65536;
 
@@ -133,6 +140,8 @@ using RingMoveQ = lock_free_container::LockFreeRingQueue<
     std::move_only_function<void()>, RING_CAPACITY>;
 using RingVariantQ = lock_free_container::LockFreeRingQueue<
     BenchVariant, RING_CAPACITY>;
+using RingStrictQ = lock_free_container::LockFreeRingQueue<
+    StrictBenchVariant, RING_CAPACITY>;
 
 // 链表队列类型（显式指定，用于对比）
 using LinkedFuncQ = lock_free_container::LockFreeQueue<
@@ -140,6 +149,7 @@ using LinkedFuncQ = lock_free_container::LockFreeQueue<
 using LinkedMoveQ = lock_free_container::LockFreeQueue<
     std::move_only_function<void()>>;
 using LinkedVariantQ = lock_free_container::LockFreeQueue<BenchVariant>;
+using LinkedStrictQ = lock_free_container::LockFreeQueue<StrictBenchVariant>;
 
 // ======================== 数据结构 ========================
 
@@ -234,7 +244,8 @@ template<typename Pool>
 IterResult run_test_once(Pool& pool, const std::vector<std::function<void()>>& tasks)
 {
     auto start = Clock::now();
-    std::vector<std::future<void>> futures;
+    // 使用 auto 推导 future 类型（兼容 std::future 和 SimpleFuture）
+    std::vector<decltype(pool.submit(tasks.front()))> futures;
     futures.reserve(tasks.size());
     for (const auto& t : tasks)
     {
@@ -262,7 +273,7 @@ PoolResult run_test_repeated(
     // 预热
     for (int w = 0; w < warmup; ++w)
     {
-        std::vector<std::future<void>> futs;
+        std::vector<decltype(pool.submit(tasks.front()))> futs;
         futs.reserve(tasks.size());
         for (const auto& t : tasks)
             futs.push_back(pool.submit(t));
@@ -354,6 +365,20 @@ ScenarioResult test_scenario(
     {
         thread_pool::VariantThreadPool<BenchVariant, RingVariantQ> pool(num_threads);
         auto r = run_test_repeated(pool, "无锁(variant+环形)", tasks, iterations, warmup);
+        scenario.pool_results.push_back(std::move(r));
+    }
+
+    // ---- 无锁 strict variant（链表队列） ----
+    {
+        thread_pool::StrictVariantThreadPool<StrictBenchVariant, LinkedStrictQ> pool(num_threads);
+        auto r = run_test_repeated(pool, "无锁(strict+链表)", tasks, iterations, warmup);
+        scenario.pool_results.push_back(std::move(r));
+    }
+
+    // ---- 无锁 strict variant（环形队列） ----
+    {
+        thread_pool::StrictVariantThreadPool<StrictBenchVariant, RingStrictQ> pool(num_threads);
+        auto r = run_test_repeated(pool, "无锁(strict+环形)", tasks, iterations, warmup);
         scenario.pool_results.push_back(std::move(r));
     }
 
