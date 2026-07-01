@@ -218,32 +218,28 @@ public:
     explicit StaticPackagedTask(F&& f, Args&&... args)
         : promise_(std::make_shared<StaticPromise<R>>())
     {
-        // 将 callable + 参数打包为 tuple，lambda 内 apply 调用
         using Bound = std::tuple<std::decay_t<F>,
                                  std::decay_t<Args>...>;
-        auto bound = std::make_shared<Bound>(
-            std::forward<F>(f), std::forward<Args>(args)...);
 
-        func_ = [bound]() -> R
+        // 可拷贝 → 按值捕获到 lambda（零额外堆分配）
+        // 不可拷贝（如 unique_ptr）→ shared_ptr 包装
+        if constexpr (std::is_copy_constructible_v<Bound>)
         {
-            if constexpr (std::is_void_v<R>)
+            func_ = [bound = Bound(std::forward<F>(f),
+                                   std::forward<Args>(args)...)]() mutable -> R
             {
-                std::apply(
-                    [](auto&& fn, auto&&... a)
-                    { std::invoke(std::forward<decltype(fn)>(fn),
-                                  std::forward<decltype(a)>(a)...); },
-                    std::move(*bound));
-            }
-            else
+                return invoke_bound(std::move(bound));
+            };
+        }
+        else
+        {
+            auto bound = std::make_shared<Bound>(
+                std::forward<F>(f), std::forward<Args>(args)...);
+            func_ = [bound]() -> R
             {
-                return std::apply(
-                    [](auto&& fn, auto&&... a)
-                    { return std::invoke(
-                          std::forward<decltype(fn)>(fn),
-                          std::forward<decltype(a)>(a)...); },
-                    std::move(*bound));
-            }
-        };
+                return invoke_bound(std::move(*bound));
+            };
+        }
     }
 
     void operator()()
@@ -277,6 +273,29 @@ public:
     ~StaticPackagedTask() = default;
 
 private:
+    // 从 Bound tuple 中调用 callable
+    template <typename Bound>
+    static R invoke_bound(Bound&& bound)
+    {
+        if constexpr (std::is_void_v<R>)
+        {
+            std::apply(
+                [](auto&& fn, auto&&... a)
+                { std::invoke(std::forward<decltype(fn)>(fn),
+                              std::forward<decltype(a)>(a)...); },
+                std::forward<Bound>(bound));
+        }
+        else
+        {
+            return std::apply(
+                [](auto&& fn, auto&&... a)
+                { return std::invoke(
+                      std::forward<decltype(fn)>(fn),
+                      std::forward<decltype(a)>(a)...); },
+                std::forward<Bound>(bound));
+        }
+    }
+
     std::function<R()> func_;
     std::shared_ptr<StaticPromise<R>> promise_;
 };

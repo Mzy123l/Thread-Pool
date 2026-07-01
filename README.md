@@ -313,15 +313,16 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 | 场景 | 有锁线程池 | function+环形 | move_only+环形 | variant+环形 | strict+环形 | 最佳加速比 |
 |------|-----------|--------------|----------------|-------------|------------|-----------|
-| 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | 456 ms | **94×** |
+| 轻量任务 (250000) | 3382 ms | 403 ms | 309 ms | 36 ms | 322 ms | **94×** |
 | 重量任务 (1000) | 13 ms | ~5.5 ms | ~5.5 ms | ~5.5 ms | ~5.7 ms | **2.4×** |
 | IO 混合 (10000) | 93 ms | 92 ms | 92 ms | 92 ms | 91 ms | 1.01× |
 
 > 测试程序：`pool/test/compare_with_mutex_pool.cpp`，编译需 `-std=c++23 -O3`。
 > 链表队列版本在轻量任务中耗时约为环形队列的 1.6–2×（每次入队需堆分配）。
-> strict 在轻量任务中比 variant 慢（自实现 StaticPackagedTask 额外分配开销），
-> 在重量/IO 任务中与 variant 持平。适用场景：需避免 `std::packaged_task`/`std::future`
-> 依赖，或需兼容 `-fno-rtti -fno-exceptions` 的构建环境。
+> strict 在轻量任务中比 variant 慢（StaticPackagedTask 内部使用 `std::function` +
+> tuple 按值捕获，比高度优化的 `std::packaged_task` 多一层调用），在重量/IO 任务中
+> 与 variant 持平。适用场景：需避免 `std::packaged_task`/`std::future` 依赖，
+> 或需兼容 `-fno-rtti -fno-exceptions` 的构建环境。
 
 ### 各线程数扩展性（variant + 环形队列）
 
