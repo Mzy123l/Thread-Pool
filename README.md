@@ -228,7 +228,7 @@ thread_pool::DynamicThreadPool<MyQueue> pool(4, alloc);
 | 方法 | 说明 |
 |------|------|
 | `submit(Func&&, Args&&...)` | 提交任务，返回 `std::future<ReturnType>` |
-| `wait_all()` | 等待所有活跃任务完成 |
+| `wait_all()` | 等待所有活跃任务完成（BatchMode::Enabled 下勿用，见性能一节） |
 | `shutdown()` | 优雅关闭：等待进行中任务完成，不再接受新任务 |
 | `shutdown_now()` | 立即关闭：丢弃未执行任务，等待进行中任务完成 |
 | `active_count()` | 当前活跃（排队中 + 执行中）任务数 |
@@ -304,6 +304,10 @@ g++ -std=c++20 -O2 -pthread pool/test/test_queue.cpp -o test_queue -latomic
 
 # move_only 测试（C++23）
 g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -latomic
+
+# 性能基准测试（C++23，-O3 推荐）
+g++ -std=c++23 -O3 -pthread -Ipool/include \
+  pool/test/test_multi_producer.cpp -o test_mp -latomic
 ```
 
 > 某些 x86-64 平台需 `-latomic`（128 位原子操作）。
@@ -341,6 +345,44 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 - **重量任务**：任务执行（fib(25) 约 70μs）远大于调度开销，无锁池 24 线程达最佳；有锁池因互斥锁上下文切换在 12 线程后退化（效率从 100% 跌至 19%）。
 - **IO 混合**：瓶颈在 sleep(1ms)，实际 CPU 占用 ≈ 线程数的 10%，各池在 12 线程以下无差异，高线程数时无锁池因锁竞争更小逐渐领先。
 - **CAS 渐进退避**：24 线程场景下退避策略减少无效 CAS 重试，相比优化前提速约 23%（66ms → 50ms）。
+
+### 优化策略实测
+
+以下测试基于 StrictVariantThreadPool + RingQueue(65536)，GCC 15.2 -O3，10000 个 `square()` 轻量任务，2 轮取平均。
+测试程序：`pool/test/test_multi_producer.cpp`、`test_batch_submit.cpp`、`test_affinity.cpp`。
+
+#### 多生产者提交
+
+单生产者是轻量任务场景的硬瓶颈——主线程串行入队速率赶不上多个工作线程的消费速度。多线程同时 `submit` 可显著缓解：
+
+| 配置 | 4 线程 | 8 线程 |
+|------|--------|--------|
+| 1 生产者 | 3.8 ms | 11.6 ms |
+| 2 生产者 | 1.7 ms (**2.3×**) | 2.8 ms (**4.3×**) |
+| 4 生产者 | 1.8 ms (**2.2×**) | 2.8 ms (**4.1×**) |
+
+> 8 线程下仅 2 生产者即获 4.3× 加速，打破了生产者速率天花板。4 线程下 2→4 生产者无进一步收益——此时瓶颈已从生产者转移到消费者 `dequeue_pos_` CAS 竞争。
+
+#### 批量入队（BatchMode）
+
+单生产者场景下，`BatchMode::Enabled` 将任务聚合为 64 个一批再入队，减少生产者侧 CAS 次数：
+
+| BatchMode | 4 线程 | 8 线程 |
+|-----------|--------|--------|
+| Disabled | 9.9 ms | 12.3 ms |
+| Enabled | 3.0 ms (**3.3×**) | 5.3 ms (**2.3×**) |
+
+> ⚠️ **已知限制**：`BatchMode::Enabled` 下调用 `wait_all()` 会死循环——任务暂存在成员缓冲区 `batch_buffer_` 中，`active_tasks_` 已递增但任务尚未入队，工作线程取不到。应直接析构线程池，析构顺序保证先 flush 再 shutdown。多线程 `submit` 同样不兼容 `BatchMode::Enabled`。
+
+#### CPU 亲和性
+
+| 配置 | 4 线程 | 8 线程 |
+|------|--------|--------|
+| 基准（全关） | 9.6 ms | 11.9 ms |
+| 仅 Affinity | 4.5 ms (**2.1×**) | 14.8 ms (0.8×) |
+| Batch + Affinity | 3.1 ms (**3.1×**) | 6.6 ms (**1.8×**) |
+
+> 亲和性在低线程数效果显著，但 8 线程下单独开启反而倒退——固定核心绑定限制了 OS 调度器处理单生产者-多消费者负载不均的能力。`BatchMode::Enabled` + `AffinityMode::Enabled` 组合在两种场景下均优于基准。
 
 ### 编译期配置
 

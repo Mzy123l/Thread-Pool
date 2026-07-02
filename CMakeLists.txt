@@ -113,7 +113,47 @@ if(COMPILER_SUPPORTS_CXX23)
     add_test(NAME test_compare COMMAND test_compare
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-    message(STATUS "C++23 supported — move_only & compare tests enabled")
+    # 独立 benchmark（自带 main），注册为普通 CTest
+    # 多生产者性能测试
+    add_executable(test_multi_producer
+        pool/test/test_multi_producer.cpp)
+    target_link_libraries(test_multi_producer PRIVATE
+        thread_pool
+        Threads::Threads)
+    target_compile_features(test_multi_producer PRIVATE cxx_std_23)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(test_multi_producer PRIVATE -Wno-psabi)
+    endif()
+    add_test(NAME test_multi_producer COMMAND test_multi_producer
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+    # 批量提交对比测试
+    add_executable(test_batch_submit
+        pool/test/test_batch_submit.cpp)
+    target_link_libraries(test_batch_submit PRIVATE
+        thread_pool
+        Threads::Threads)
+    target_compile_features(test_batch_submit PRIVATE cxx_std_23)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(test_batch_submit PRIVATE -Wno-psabi)
+    endif()
+    add_test(NAME test_batch_submit COMMAND test_batch_submit
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+    # CPU 亲和性测试
+    add_executable(test_affinity
+        pool/test/test_affinity.cpp)
+    target_link_libraries(test_affinity PRIVATE
+        thread_pool
+        Threads::Threads)
+    target_compile_features(test_affinity PRIVATE cxx_std_23)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(test_affinity PRIVATE -Wno-psabi)
+    endif()
+    add_test(NAME test_affinity COMMAND test_affinity
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+    message(STATUS "C++23 supported — move_only & compare & multi_producer & batch & affinity tests enabled")
 else()
     message(STATUS "C++23 NOT supported — move_only & compare tests skipped")
 endif()
