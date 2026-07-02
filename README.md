@@ -93,8 +93,10 @@ thread_pool::LockFreeThreadPool pool2(2);
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `QueueType` | `LockFreeQueue<std::function<void()>>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关（启用后**多生产者不安全**） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
+
+> ⚠️ `BatchMode::Enabled` 使用非原子的成员缓冲区累积任务，仅当**单线程调用 submit** 时安全。多生产者场景须保持 `Disabled`。
 
 分配器类型从 `QueueType::allocator_type` 推导（同 `std::priority_queue` 设计）：
 
@@ -129,7 +131,7 @@ thread_pool::LockFreeMoveOnlyThreadPool pool2(2);
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `QueueType` | `LockFreeQueue<std::move_only_function<void()>>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关（启用后**多生产者不安全**） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ### 3. VariantThreadPool
@@ -154,7 +156,7 @@ auto fut = pool.submit([]{ return 42; });  // 自动走 packaged_task<int()>
 |------|--------|------|
 | `VariantType` | — | 任务 variant 类型，须包含对应返回类型的 `packaged_task` 或 `std::function<void()>` 兜底 |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关（启用后**多生产者不安全**） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 ### 4. StrictVariantThreadPool
@@ -184,7 +186,7 @@ std::cout << fut.get();  // 42
 |------|--------|------|
 | `VariantType` | — | 任务 variant 类型，须包含对应返回类型的 `StaticPackagedTask<T()>` |
 | `QueueType` | `LockFreeQueue<VariantType>` | 底层无锁队列类型 |
-| `BatchMode` | `BatchMode::Disabled` | 批量入队开关 |
+| `BatchMode` | `BatchMode::Disabled` | 批量入队开关（启用后**多生产者不安全**） |
 | `AffinityMode` | `AffinityMode::Disabled` | CPU 亲和性绑定开关 |
 
 > 与 VariantThreadPool 的核心区别：自实现 task/future/function 替代 `std::packaged_task`/
@@ -346,7 +348,7 @@ g++ -std=c++23 -O2 -pthread pool/test/test_move_only.cpp -o test_move_only -lato
 
 | 选项 | 枚举值 | 说明 |
 |------|--------|------|
-| `BatchMode` | `Disabled`（默认）/ `Enabled` | 将任务聚合为批次一次性入队，减少 CAS 次数 |
+| `BatchMode` | `Disabled`（默认）/ `Enabled` | 批次入队减少 CAS（⚠️ Enabled 仅单生产者安全） |
 | `AffinityMode` | `Disabled`（默认）/ `Enabled` | Linux 下 `pthread_setaffinity_np` 绑定线程到不同核心 |
 
 ```cpp
@@ -362,7 +364,7 @@ thread_pool::VariantThreadPool<MyVariant, MyQ,
     thread_pool::AffinityMode::Enabled> pool(8);
 ```
 
-底层自动生效的优化：PAUSE→yield→sleep 三级 CAS 退避、每线程独立统计槽位消除 `completed_count()` 缓存弹跳、`submit()` 多生产者安全。
+底层自动生效的优化：PAUSE→yield→sleep 三级 CAS 退避、每线程独立统计槽位消除 `completed_count()` 缓存弹跳、`submit()` 多生产者安全（`BatchMode::Disabled` 时）。
 
 ## 编译器要求
 
