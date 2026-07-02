@@ -153,7 +153,20 @@ if(COMPILER_SUPPORTS_CXX23)
     add_test(NAME test_affinity COMMAND test_affinity
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-    message(STATUS "C++23 supported — move_only & compare & multi_producer & batch & affinity tests enabled")
+    # 多生产者 vs 批量入队对比测试
+    add_executable(test_mp_vs_batch
+        pool/test/test_mp_vs_batch.cpp)
+    target_link_libraries(test_mp_vs_batch PRIVATE
+        thread_pool
+        Threads::Threads)
+    target_compile_features(test_mp_vs_batch PRIVATE cxx_std_23)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(test_mp_vs_batch PRIVATE -Wno-psabi)
+    endif()
+    add_test(NAME test_mp_vs_batch COMMAND test_mp_vs_batch
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+    message(STATUS "C++23 supported — move_only & compare & multi_producer & batch & affinity & mp_vs_batch tests enabled")
 else()
     message(STATUS "C++23 NOT supported — move_only & compare tests skipped")
 endif()

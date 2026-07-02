@@ -145,8 +145,14 @@ public:
     ~LockFreeThreadPoolBase() { shutdown(); }
 
     // ---- 等待所有活跃任务完成 ----
+    // BatchMode::Enabled 时须先将缓冲区中的任务刷入队列，
+    // 否则工作线程取不到任务，active_tasks_ 永远不会归零。
     void wait_all()
     {
+        if constexpr (BatchV == BatchMode::Enabled)
+        {
+            flush_batch();
+        }
         while (POOL_UNLIKELY(
             active_tasks_.load(std::memory_order_acquire) > 0))
         {

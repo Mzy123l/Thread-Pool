@@ -25,31 +25,26 @@ constexpr size_t TASKS = 10000;
 
 long long square(long long x) { volatile long long y = x * x; return y; }
 
-// 用作用域析构来确保 BatchMode 的批量缓冲区被 flush（析构函数保证 flush→shutdown 顺序）
 template <typename Pool>
 double run_once(int nw)
 {
+    Pool pool(static_cast<size_t>(nw));
     auto t0 = Clock::now();
-    {
-        Pool pool(static_cast<size_t>(nw));
-        for (size_t i = 0; i < TASKS; ++i)
-            pool.submit([i]() { square(i % 1024); });
-        // 不能调 wait_all()（BatchMode 任务还在缓冲区），
-        // 直接让析构函数：先 ensure_batch_flushed → 再 shutdown（join workers）
-    }
+    for (size_t i = 0; i < TASKS; ++i)
+        pool.submit([i]() { square(i % 1024); });
+    pool.wait_all();  // BatchMode 下自动先 flush 缓冲区
     auto t1 = Clock::now();
+    pool.shutdown();
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
 int main()
 {
     std::cout << "批量提交测试  GCC -O3  任务:" << TASKS
-              << "  迭代:" << ITER << "  (单生产者)" << std::endl
-              << "  注: BatchMode::Enabled 依赖析构函数 flush→shutdown 顺序" << std::endl << std::endl;
+              << "  迭代:" << ITER << "  (单生产者)" << std::endl << std::endl;
 
     for (int nw : {4, 8})
     {
-        // BatchMode::Disabled
         {
             std::vector<double> times;
             for (int r = 0; r < ITER; ++r)
@@ -59,7 +54,6 @@ int main()
                       << std::fixed << std::setprecision(2) << a << " ms"
                       << "  [" << times[0] << ", " << times[1] << "]" << std::endl;
         }
-        // BatchMode::Enabled
         {
             std::vector<double> times;
             for (int r = 0; r < ITER; ++r)

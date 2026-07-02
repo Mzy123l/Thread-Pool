@@ -30,14 +30,13 @@ long long square(long long x) { volatile long long y = x * x; return y; }
 template <typename Pool>
 double run_once(int nw)
 {
+    Pool pool(static_cast<size_t>(nw));
     auto t0 = Clock::now();
-    {
-        Pool pool(static_cast<size_t>(nw));
-        for (size_t i = 0; i < TASKS; ++i)
-            pool.submit([i]() { square(i % 1024); });
-        // 析构函数确保 BatchMode flush → shutdown 的正确顺序
-    }
+    for (size_t i = 0; i < TASKS; ++i)
+        pool.submit([i]() { square(i % 1024); });
+    pool.wait_all();
     auto t1 = Clock::now();
+    pool.shutdown();
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
@@ -48,7 +47,6 @@ int main()
 
     for (int nw : {4, 8})
     {
-        // 基准: 全关
         {
             std::vector<double> times;
             for (int r = 0; r < ITER; ++r) times.push_back(run_once<PoolBase>(nw));
@@ -57,7 +55,6 @@ int main()
                       << std::fixed << std::setprecision(2) << a << " ms"
                       << "  [" << times[0] << ", " << times[1] << "]" << std::endl;
         }
-        // Affinity 单独
         {
             std::vector<double> times;
             for (int r = 0; r < ITER; ++r) times.push_back(run_once<PoolAff>(nw));
@@ -66,7 +63,6 @@ int main()
                       << std::fixed << std::setprecision(2) << a << " ms"
                       << "  [" << times[0] << ", " << times[1] << "]" << std::endl;
         }
-        // Batch + Affinity
         {
             std::vector<double> times;
             for (int r = 0; r < ITER; ++r) times.push_back(run_once<PoolBatchAff>(nw));
